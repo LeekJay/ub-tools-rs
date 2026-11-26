@@ -1,0 +1,40 @@
+[package]
+name = "crapper"
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+publish = false
+description = "Pure Rust port of unclebob/crapper (CRAP complexity and coverage scorer)"
+
+[lib]
+name = "crapper_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crapper"
+path = "src/main.rs"
+
+[dependencies]
+rayon = "1"
+regex = "1"
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tree-sitter = "0.27.2"
+tree-sitter-clojure-orchard = "0.2.9"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "=0.23.6"
+tree-sitter-rust = "0.24.2"
+tree-sitter-swift = "0.7.4"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-vue-next = "0.1.0"
+walkdir = "2"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lints.rust]
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"

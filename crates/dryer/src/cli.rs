@@ -1,0 +1,692 @@
+//! Command line parsing, git-changed file selection, and report orchestration.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use super::discover::{
+    SKIP_DIRS, TEST_DIRS, is_test_file, iter_source_files, language_of, resolve_path, to_posix,
+};
+use super::report::{format_text, render_edn, write_metrics};
+use super::scan::{find_duplicates, scan_files};
+
+pub fn skipped_directory_text() -> String {
+    let mut ordered: Vec<&str> = SKIP_DIRS.iter().chain(TEST_DIRS.iter()).copied().collect();
+    ordered.sort_unstable();
+    ordered.dedup();
+    let last = ordered.pop().expect("non-empty skip dirs");
+    format!("{}, and {last}", ordered.join(", "))
+}
+
+pub fn help_text() -> String {
+    format!(
+        "Usage: dryer [options] [path-or-filter ...]
+
+Find candidate duplicate code in Clojure, Java, Go, TypeScript, Vue, Rust,
+Python, and Swift. Each form is normalized — call and method names, operators,
+and tree shape stay; local names, field names, and literals do not — and
+compared with the other forms of the same language. The score is Jaccard
+similarity of those structural fingerprints, the same score as dry4clj.
+
+Prints a report and writes .metrics/dry.edn.
+
+Languages: Clojure (.clj .cljc .cljs .cljd .bb), Java (.java), Go (.go),
+TypeScript (.ts .tsx .mts .cts), Vue (.vue), Rust (.rs), Python (.py),
+Swift (.swift).
+
+Options:
+  -h, --help                    Print this help and exit.
+  --root <path>                 Project root. Metrics are written here.
+                                Default: the current directory.
+  -s, --source-root <path>      Walk this tree instead of the project root.
+                                May be repeated.
+  --changed                     Compare added and modified source files from
+                                git status.
+  --threshold N                 Minimum similarity score, default 0.82.
+  --min-lines N                 Minimum source lines in a candidate form,
+                                default 4.
+  --min-nodes N                 Minimum normalized syntax nodes, default 20.
+  --format F                    text or edn, default text.
+  --edn                         Same as --format edn.
+  --text                        Same as --format text.
+
+Arguments:
+  path              File or directory to compare. Test paths are included when
+                    you name them explicitly.
+  filter            When the argument is not a path, only source files whose
+                    path contains this text are compared.
+
+With no paths, source files under the project root are compared. Directories
+named {} are skipped, as are *_test.go, *.test.cts,
+*.spec.cts, *.spec.ts, *.test.vue, *.spec.vue, test_*.py, *_test.py, and
+*Tests.swift files.
+
+Clojure compares every top-level form except ns. The other languages compare
+functions and methods. Swift also compares computed properties, including a
+SwiftUI view body, a closure bound at file scope, and deinit. Vue `<script>`
+blocks normalize and compare alongside TypeScript (functions, methods,
+Options API hooks, and top-level Composition API callbacks). A form is only
+compared with forms in the same language.
+
+Exit codes:
+  0  the report was written
+  1  usage error
+  2  unknown output format
+",
+        skipped_directory_text()
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    Help,
+    Format,
+    Scan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Options {
+    pub action: Action,
+    pub message: String,
+    pub exit_code: i32,
+    pub project_root: PathBuf,
+    pub source_roots: Vec<String>,
+    pub positionals: Vec<String>,
+    pub threshold: f64,
+    pub min_lines: usize,
+    pub min_nodes: usize,
+    pub format: String,
+    pub changed: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            action: Action::Scan,
+            message: String::new(),
+            exit_code: 0,
+            project_root: PathBuf::from("."),
+            source_roots: Vec::new(),
+            positionals: Vec::new(),
+            threshold: 0.82,
+            min_lines: 4,
+            min_nodes: 20,
+            format: "text".to_string(),
+            changed: false,
+        }
+    }
+}
+
+fn take_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
+    let Some(val) = args.get(index + 1) else {
+        return Err(format!("{option} requires a value"));
+    };
+    if val.is_empty() || val.starts_with('-') {
+        return Err(format!("{option} requires a value"));
+    }
+    Ok(val.as_str())
+}
+
+fn parse_number(value: &str, option: &str) -> Result<f64, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{option} requires a number"))
+}
+
+pub fn parse_count(value: &str, option: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{option} requires an integer"));
+    }
+    let (negative, digits) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, trimmed)
+    };
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+        || !digits.chars().all(|c| c.is_ascii_digit() || c == '_')
+    {
+        return Err(format!("{option} requires an integer"));
+    }
+    let all_zero = digits.chars().filter(|&c| c != '_').all(|c| c == '0');
+    if negative && !all_zero {
+        return Err(format!("{option} requires a non-negative integer"));
+    }
+    let mut acc: usize = 0;
+    for ch in digits.chars() {
+        if ch == '_' {
+            continue;
+        }
+        let digit = (ch as u8 - b'0') as usize;
+        acc = acc.saturating_mul(10).saturating_add(digit);
+    }
+    Ok(acc)
+}
+
+pub fn parse_args(args: &[String]) -> Options {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return Options {
+            action: Action::Help,
+            message: help_text(),
+            exit_code: 0,
+            ..Options::default()
+        };
+    }
+
+    let mut options = Options::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let step = match arg.as_str() {
+            "-s" | "--source-root" => match take_value(args, index, arg) {
+                Ok(v) => {
+                    options.source_roots.push(v.to_string());
+                    Ok(2)
+                }
+                Err(e) => Err(e),
+            },
+            "--root" => match take_value(args, index, arg) {
+                Ok(v) => {
+                    options.project_root = PathBuf::from(v);
+                    Ok(2)
+                }
+                Err(e) => Err(e),
+            },
+            "--threshold" => take_value(args, index, arg)
+                .and_then(|v| parse_number(v, arg))
+                .map(|v| {
+                    options.threshold = v;
+                    2
+                }),
+            "--min-lines" => take_value(args, index, arg)
+                .and_then(|v| parse_count(v, arg))
+                .map(|v| {
+                    options.min_lines = v;
+                    2
+                }),
+            "--min-nodes" => take_value(args, index, arg)
+                .and_then(|v| parse_count(v, arg))
+                .map(|v| {
+                    options.min_nodes = v;
+                    2
+                }),
+            "--format" => take_value(args, index, arg).map(|v| {
+                options.format = v.to_string();
+                2
+            }),
+            "--edn" => {
+                options.format = "edn".to_string();
+                Ok(1)
+            }
+            "--text" => {
+                options.format = "text".to_string();
+                Ok(1)
+            }
+            "--changed" => {
+                options.changed = true;
+                Ok(1)
+            }
+            _ if arg.starts_with('-') => Err(format!("Unknown option: {arg}")),
+            _ => {
+                options.positionals.push(arg.clone());
+                Ok(1)
+            }
+        };
+        match step {
+            Ok(advance) => index += advance,
+            Err(err) => {
+                return Options {
+                    action: Action::Help,
+                    message: format!("{err}\n\n{}", help_text()),
+                    exit_code: 1,
+                    ..Options::default()
+                };
+            }
+        }
+    }
+
+    if options.format != "text" && options.format != "edn" {
+        return Options {
+            action: Action::Format,
+            message: format!("Unknown format: {}\n", options.format),
+            exit_code: 2,
+            ..Options::default()
+        };
+    }
+
+    options
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitStatusError {
+    pub code: i32,
+    pub message: String,
+}
+
+fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, GitStatusError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|err| GitStatusError {
+            code: 1,
+            message: err.to_string(),
+        })?;
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(1);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            "git status failed".to_string()
+        } else {
+            stderr
+        };
+        return Err(GitStatusError { code, message });
+    }
+    Ok(output.stdout)
+}
+
+pub fn changed_files(root: &Path) -> Result<Vec<PathBuf>, GitStatusError> {
+    let toplevel_bytes = run_git(root, &["rev-parse", "--show-toplevel"])?;
+    let toplevel_str = String::from_utf8_lossy(&toplevel_bytes).trim().to_string();
+    let toplevel = PathBuf::from(toplevel_str);
+    let status = run_git(
+        root,
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ],
+    )?;
+    let root_resolved = resolve_path(root);
+    let mut found = Vec::new();
+    for entry in status.split(|&b| b == 0) {
+        if entry.len() <= 3 {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(&entry[3..]);
+        let path = resolve_path(&toplevel.join(rel.as_ref()));
+        if !path.is_file() || !path.starts_with(&root_resolved) {
+            continue;
+        }
+        found.push(path);
+    }
+    Ok(found)
+}
+
+pub fn tracked_source(path: &Path, root: Option<&Path>) -> bool {
+    let resolved;
+    let rel = if let Some(base) = root {
+        resolved = resolve_path(path);
+        let base_resolved = resolve_path(base);
+        let Ok(stripped) = resolved.strip_prefix(&base_resolved) else {
+            return false;
+        };
+        stripped
+    } else {
+        path
+    };
+    let in_skip_dir = rel.components().any(|component| match component {
+        std::path::Component::Normal(part) => {
+            part.to_str().is_some_and(|name| SKIP_DIRS.contains(&name))
+        }
+        _ => false,
+    });
+    if in_skip_dir {
+        return false;
+    }
+    if language_of(path).is_none() {
+        return false;
+    }
+    !is_test_file(path)
+}
+
+fn changed_source(root: &Path) -> Result<Vec<PathBuf>, GitStatusError> {
+    let changed = changed_files(root)?;
+    Ok(changed
+        .into_iter()
+        .filter(|path| tracked_source(path, Some(root)))
+        .collect())
+}
+
+fn positionals(root: &Path, args: &[String]) -> (Vec<PathBuf>, Vec<String>) {
+    let mut existing = Vec::new();
+    let mut filters = Vec::new();
+    for arg in args {
+        let candidate = if Path::new(arg).is_absolute() {
+            PathBuf::from(arg)
+        } else {
+            root.join(arg)
+        };
+        if candidate.exists() {
+            existing.push(resolve_path(&candidate));
+        } else {
+            filters.push(arg.clone());
+        }
+    }
+    (existing, filters)
+}
+
+fn explicit_files(existing: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in existing {
+        if path.is_dir() {
+            files.extend(iter_source_files(std::slice::from_ref(path)));
+        } else if language_of(path).is_some() {
+            files.push(path.clone());
+        }
+    }
+    files
+}
+
+fn selected(
+    options: &Options,
+    root: &Path,
+    existing: &[PathBuf],
+) -> Result<Vec<PathBuf>, GitStatusError> {
+    if options.changed {
+        return changed_source(root);
+    }
+    if !options.source_roots.is_empty() {
+        let roots: Vec<PathBuf> = options
+            .source_roots
+            .iter()
+            .map(|p| resolve_path(&root.join(p)))
+            .collect();
+        return Ok(iter_source_files(&roots));
+    }
+    if !existing.is_empty() {
+        return Ok(explicit_files(existing));
+    }
+    Ok(iter_source_files(std::slice::from_ref(&root.to_path_buf())))
+}
+
+fn apply_filters(files: Vec<PathBuf>, filters: &[String]) -> Vec<PathBuf> {
+    if filters.is_empty() {
+        return files;
+    }
+    files
+        .into_iter()
+        .filter(|path| {
+            let posix = to_posix(path);
+            filters.iter().any(|item| posix.contains(item.as_str()))
+        })
+        .collect()
+}
+
+pub fn select_files(options: &Options) -> Result<Vec<PathBuf>, GitStatusError> {
+    let root = resolve_path(&options.project_root);
+    let (existing, filters) = positionals(&root, &options.positionals);
+    let candidates = apply_filters(selected(options, &root, &existing)?, &filters);
+    let mut unique = BTreeMap::new();
+    for path in candidates {
+        let resolved = resolve_path(&path);
+        let key = to_posix(&resolved);
+        unique.entry(key).or_insert(resolved);
+    }
+    Ok(unique.into_values().collect())
+}
+
+pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let options = parse_args(args);
+    match options.action {
+        Action::Help => {
+            if options.exit_code == 0 {
+                let _ = write!(out, "{}", options.message);
+                if !options.message.ends_with('\n') {
+                    let _ = writeln!(out);
+                }
+            } else {
+                let _ = write!(err, "{}", options.message);
+                if !options.message.ends_with('\n') {
+                    let _ = writeln!(err);
+                }
+            }
+            return options.exit_code;
+        }
+        Action::Format => {
+            let _ = write!(err, "{}", options.message);
+            return options.exit_code;
+        }
+        Action::Scan => {}
+    }
+
+    let root = resolve_path(&options.project_root);
+    let files = match select_files(&options) {
+        Ok(files) => files,
+        Err(git_err) => {
+            let _ = writeln!(err, "{}", git_err.message);
+            return git_err.code;
+        }
+    };
+    if files.is_empty() {
+        let _ = writeln!(out, "No source files to analyze.");
+        return 0;
+    }
+
+    let (entries, warnings) = scan_files(&files, &root, options.min_lines, options.min_nodes);
+    for warning in warnings {
+        let _ = writeln!(err, "dryer: {warning}");
+    }
+    let candidates = find_duplicates(&entries, options.threshold);
+    match write_metrics(&candidates, &root) {
+        Ok(metrics) => {
+            if options.format == "edn" {
+                let _ = write!(out, "{}", render_edn(&candidates));
+            } else {
+                let _ = write!(out, "{}", format_text(&candidates));
+            }
+            let _ = writeln!(err, "Wrote {}", metrics.display());
+            0
+        }
+        Err(io_err) => {
+            let _ = writeln!(err, "dryer: failed to write metrics: {io_err}");
+            1
+        }
+    }
+}
+
+pub fn run(args: &[String]) -> i32 {
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    run_with_writers(args, &mut stdout, &mut stderr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_options_and_rejects_bad_inputs() {
+        let help = parse_args(&s(&["--help"]));
+        assert_eq!(help.action, Action::Help);
+        assert_eq!(help.exit_code, 0);
+        assert!(help.message.contains("Usage: dryer"));
+        assert!(help.message.contains("__pycache__"));
+        assert!(help.message.contains("*Tests.swift"));
+
+        let fmt = parse_args(&s(&["--format", "csv"]));
+        assert_eq!(fmt.exit_code, 2);
+        assert_eq!(fmt.message, "Unknown format: csv\n");
+
+        let unknown = parse_args(&s(&["--nope"]));
+        assert_eq!(unknown.exit_code, 1);
+        assert!(unknown.message.contains("Unknown option: --nope"));
+
+        let parsed = parse_args(&s(&[
+            "--threshold",
+            "0.9",
+            "--min-lines",
+            "5",
+            "--min-nodes",
+            "30",
+            "--edn",
+            "spec",
+        ]));
+        assert_eq!(parsed.threshold, 0.9);
+        assert_eq!(parsed.min_lines, 5);
+        assert_eq!(parsed.min_nodes, 30);
+        assert_eq!(parsed.format, "edn");
+        assert_eq!(parsed.positionals, vec!["spec"]);
+    }
+
+    #[test]
+    fn runs_clojure_scan_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("dryer-cli-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("left.cljc"),
+            "(ns sample.left)\n\n(defn alpha [xs]\n  (let [ys (filter odd? xs)]\n    (map inc ys)))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("right.cljc"),
+            "(ns sample.right)\n\n(defn beta [items]\n  (let [kept (filter even? items)]\n    (map dec kept)))\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_writers(
+            &s(&[
+                "--root",
+                dir.to_str().unwrap(),
+                "--min-lines",
+                "3",
+                "--min-nodes",
+                "8",
+            ]),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(out_str.contains("DUPLICATE score=1.00"));
+        assert!(out_str.contains("left.cljc:3-5"));
+        assert!(out_str.contains("right.cljc:3-5"));
+        let edn = std::fs::read_to_string(dir.join(".metrics").join("dry.edn")).unwrap();
+        assert!(edn.contains(":language \"clojure\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_files_reads_real_git_status_and_reports_failures() {
+        let base = std::env::temp_dir().join(format!("dryer-git-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let non_repo = base.join("plain");
+        std::fs::create_dir_all(&non_repo).unwrap();
+        let err = changed_files(&non_repo).unwrap_err();
+        assert_eq!(err.code, 128);
+        assert!(err.message.to_lowercase().contains("not a git repository"));
+
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.email", "dev@example.com"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.name", "Dev"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("src/a.py"), "x = 1\n").unwrap();
+        std::fs::write(repo.join("src/old.py"), "x = 1\n").unwrap();
+        std::fs::write(repo.join("gone.py"), "x = 1\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "base"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        std::fs::remove_file(repo.join("gone.py")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["mv", "src/old.py", "src/b.py"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(repo.join("src/c d.py"), "x = 1\n").unwrap();
+        std::fs::write(repo.join("src/café.py"), "x = 1\n").unwrap();
+
+        let found = changed_files(&repo).unwrap();
+        assert!(found.contains(&resolve_path(&repo.join("src/b.py"))));
+        assert!(found.contains(&resolve_path(&repo.join("src/c d.py"))));
+        assert!(found.contains(&resolve_path(&repo.join("src/café.py"))));
+        assert!(!found.contains(&resolve_path(&repo.join("gone.py"))));
+
+        // Subdirectory isolation + --source-root + filter + format override
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(sub.join("src")).unwrap();
+        std::fs::write(sub.join("src/below.py"), "x = 1\n").unwrap();
+        let sub_opts = parse_args(&s(&["--root", sub.to_str().unwrap(), "--changed"]));
+        let sub_selected = select_files(&sub_opts).unwrap();
+        assert_eq!(sub_selected, vec![resolve_path(&sub.join("src/below.py"))]);
+
+        let text_opts = parse_args(&s(&["--edn", "--text"]));
+        assert_eq!(text_opts.format, "text");
+
+        assert_eq!(
+            parse_count("18446744073709551616", "--min-lines"),
+            Ok(usize::MAX)
+        );
+        assert_eq!(parse_count("1_000", "--min-lines"), Ok(1000));
+        assert_eq!(parse_count("-0", "--min-lines"), Ok(0));
+        assert!(
+            parse_count("-1", "--min-lines")
+                .unwrap_err()
+                .contains("non-negative")
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

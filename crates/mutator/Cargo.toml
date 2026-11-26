@@ -1,0 +1,42 @@
+[package]
+name = "mutator"
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+publish = false
+description = "Pure Rust port of unclebob/mutator (multi-language mutation testing)"
+
+[lib]
+name = "mutator_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mutator"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4"
+crapper_lib = { package = "crapper", path = "../crapper" }
+rayon = "1"
+regex = "1"
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "unbounded_depth"] }
+sha2 = "0.10"
+tree-sitter = "0.27.2"
+tree-sitter-clojure-orchard = "0.2.9"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "=0.23.6"
+tree-sitter-rust = "0.24.2"
+tree-sitter-swift = "0.7.4"
+tree-sitter-typescript = "0.23.2"
+uuid = { version = "1", features = ["v4"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lints.rust]
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"

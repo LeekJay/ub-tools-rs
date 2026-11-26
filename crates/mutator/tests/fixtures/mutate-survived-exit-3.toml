@@ -1,0 +1,5 @@
+bin.name = "mutator"
+args = ["--no-coverage", "--mutate-all", "--max-workers", "1", "--test-command", """python -c "import sys; sys.path.insert(0, 'src'); from demo import add; raise SystemExit(0 if add(2, 3) == 5 else 1)"""", "src/demo.py"]
+status.code = 3
+fs.sandbox = true
+fs.base = "mutate-survived-exit-3.in"

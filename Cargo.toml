@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/crapper", "crates/dryer", "crates/mutator"]
+resolver = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

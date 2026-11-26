@@ -1,0 +1,5 @@
+bin.name = "mutator"
+args = ["--no-coverage", "--mutate-all", "--max-workers", "9007199254740993", "--test-command", """python -c "import sys; sys.path.insert(0, 'src'); from demo import add; raise SystemExit(0 if add(2, 3) == 5 else 1)"""", "src/demo.py"]
+status.code = 0
+fs.sandbox = true
+fs.base = "trap-137-no-coverage.in"
