@@ -10,6 +10,9 @@ const ENV_NO_METRICS: &str = "UB_TOOLS_NO_METRICS";
 const MIN_RAYON_THREADS: usize = 1;
 const MAX_RAYON_THREADS: usize = 6;
 const MIN_MUTATOR_WORKERS: usize = 1;
+#[cfg(windows)]
+const MAX_DEFAULT_MUTATOR_WORKERS: usize = 2;
+#[cfg(not(windows))]
 const MAX_DEFAULT_MUTATOR_WORKERS: usize = 4;
 
 fn available_cores() -> usize {
@@ -126,19 +129,39 @@ mod tests {
 
     #[test]
     fn resolves_default_mutator_workers_with_and_without_override() {
+        #[cfg(windows)]
+        assert_eq!(MAX_DEFAULT_MUTATOR_WORKERS, 2);
+        #[cfg(not(windows))]
+        assert_eq!(MAX_DEFAULT_MUTATOR_WORKERS, 4);
+
         assert_eq!(default_mutator_workers_from(0, None), 1);
         assert_eq!(default_mutator_workers_from(1, None), 1);
         assert_eq!(default_mutator_workers_from(4, None), 1);
         assert_eq!(default_mutator_workers_from(8, None), 2);
-        assert_eq!(default_mutator_workers_from(12, None), 3);
-        assert_eq!(default_mutator_workers_from(16, None), 4);
-        assert_eq!(default_mutator_workers_from(32, None), 4);
+        assert_eq!(
+            default_mutator_workers_from(12, None),
+            MAX_DEFAULT_MUTATOR_WORKERS
+        );
+        assert_eq!(
+            default_mutator_workers_from(16, None),
+            MAX_DEFAULT_MUTATOR_WORKERS
+        );
+        assert_eq!(
+            default_mutator_workers_from(32, None),
+            MAX_DEFAULT_MUTATOR_WORKERS
+        );
 
         assert_eq!(default_mutator_workers_from(16, Some(" 7 ")), 7);
         assert_eq!(default_mutator_workers_from(4, Some("10")), 4);
         assert_eq!(default_mutator_workers_from(0, Some("3")), 1);
-        assert_eq!(default_mutator_workers_from(16, Some("0")), 4);
-        assert_eq!(default_mutator_workers_from(16, Some("bad")), 4);
+        assert_eq!(
+            default_mutator_workers_from(16, Some("0")),
+            MAX_DEFAULT_MUTATOR_WORKERS
+        );
+        assert_eq!(
+            default_mutator_workers_from(16, Some("bad")),
+            MAX_DEFAULT_MUTATOR_WORKERS
+        );
     }
 
     #[test]

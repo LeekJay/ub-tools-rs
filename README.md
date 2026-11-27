@@ -83,7 +83,7 @@ Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\
 > All three CLIs initialize `ub-runtime` automatically so concurrent multi-agent tool calls keep host editors responsive and prevent `.metrics/` corruption.
 
 * **Lowered OS priority** runs processes at `Below Normal` on Windows by default (`UB_TOOLS_PRIORITY`), and spawned test or coverage subprocesses inherit that priority.
-* **Bounded CPU pools** cap `rayon` threads at `min(6, cores/2)` (at least `1`) and `mutator` workers at `min(4, cores/4)` (at least `1`).
+* **Bounded CPU pools** cap `rayon` threads at `min(6, cores/2)` (at least `1`) and `mutator` workers at `min(2, cores/4)` on Windows or `min(4, cores/4)` elsewhere (at least `1`).
 * **Cross-process scan slots** limit concurrent `crapper`, `dryer`, and `mutator --scan` runs to `2` global slots via OS locks under `ub-tools-locks/` in the system temp directory.
 * **Repository kernel locks and atomic `.edn` writes** serialize per-repo coverage runs, mutation runs, and `.metrics/mutate/*.edn` updates while staging writes in unique sibling temp files with Windows sharing retries.
 * **Report-only mode** via `--no-metrics` (or `UB_TOOLS_NO_METRICS`) prints `crapper` and `dryer` reports and preserves threshold exit codes without touching `.metrics/`.
@@ -98,7 +98,7 @@ Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\
 
 * Parallel file discovery, parsing, and AST extraction via `rayon` with pruned directory traversal (`SKIP_DIRS`, `lcov-report`).
 * Prefix-filtered Jaccard similarity in `dryer` with compact integer token interning, frequency ordering, length-ratio bounds, and two-pointer early-exit intersection.
-* Zero-regex LCOV parsing with basename buckets in `crapper`, plus `RwLock` + `NormalizedIndex` coverage caching, single-pass `.metrics/mutate/*.edn` history indexing, skipped SHA-256 form hashing without prior history, reusable in-memory JS/TS reverse-import graphs, and parallel worker overlay creation and cleanup in `mutator`.
+* Zero-regex LCOV parsing with basename buckets in `crapper`, plus `RwLock` + `NormalizedIndex` coverage caching, single-pass `.metrics/mutate/*.edn` history indexing, skipped SHA-256 form hashing without prior history, reusable in-memory JS/TS reverse-import graphs, and parallel single-write `run-active` worker overlays with symlinked read-only lockfiles in `mutator`.
 
 ## Benchmarks
 
@@ -134,7 +134,7 @@ Measured on a static snapshot of a 3,522-file TypeScript monorepo (`src/domain` 
 | --- | --- | --- |
 | `UB_TOOLS_PRIORITY` | `below_normal` | Process priority (`below_normal`, `low`, `idle`, or `normal`) for CLIs and children |
 | `UB_TOOLS_THREADS` | `min(6, cores/2)` | Override `rayon` global thread pool size (falls back to `RAYON_NUM_THREADS` when unset) |
-| `UB_TOOLS_MUTATOR_WORKERS` | `min(4, cores/4)` | Override default `mutator` worker count when `--max-workers` is omitted |
+| `UB_TOOLS_MUTATOR_WORKERS` | `min(2, cores/4)` on Windows, `min(4, cores/4)` elsewhere | Override default `mutator` worker count when `--max-workers` is omitted |
 | `UB_TOOLS_MAX_CONCURRENT` | `2` | Global scan lock slots across `crapper`, `dryer`, and `mutator --scan` (`0` disables) |
 | `UB_TOOLS_NO_METRICS` | unset | Skip writing `.metrics/crap.edn` and `.metrics/dry.edn` when set to `1`, `true`, or `yes` |
 | `UB_TOOLS_CACHE_DIR` | OS cache dir (`%LOCALAPPDATA%\ub-tools-cache` or `~/.cache/ub-tools-cache`) | Override directory storing per-repository `UBC1` incremental cache files |

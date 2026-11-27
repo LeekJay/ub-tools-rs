@@ -64,6 +64,15 @@ pub const CONFIGS: &[&str] = &[
     "poetry.lock",
 ];
 
+const LOCKFILES: &[&str] = &[
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "go.sum",
+    "poetry.lock",
+];
+
 const JS_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
 
 static SPECIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -130,6 +139,19 @@ pub fn new_run_dir(root: &Path) -> std::io::Result<PathBuf> {
         .join(format!("run-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory)?;
     Ok(directory)
+}
+
+fn acquire_run_dir(root: &Path) -> std::io::Result<PathBuf> {
+    let workers_dir = root.join("target").join("mutation-workers");
+    std::fs::create_dir_all(&workers_dir)?;
+    let stable = workers_dir.join("run-active");
+    if std::fs::symlink_metadata(&stable).is_ok() {
+        let _ = delete_tree_with(&stable, 2, std::thread::sleep);
+    }
+    match std::fs::create_dir(&stable) {
+        Ok(()) => Ok(stable),
+        Err(_) => new_run_dir(root),
+    }
 }
 
 fn remove_link_entry(path: &Path) -> std::io::Result<()> {
@@ -289,8 +311,11 @@ fn delete_once(path: &Path) -> std::io::Result<()> {
 fn read_configs(root: &Path, relative: &str) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     let mut configs = Vec::new();
     for &name in CONFIGS {
+        if LOCKFILES.contains(&name) || name == relative {
+            continue;
+        }
         let source = root.join(name);
-        if !source.is_file() || name == relative {
+        if !source.is_file() {
             continue;
         }
         configs.push((name.to_string(), std::fs::read(&source)?));
@@ -774,12 +799,14 @@ pub struct MutantRunConfig<'a> {
     pub file_key: &'a str,
 }
 
-pub fn execute_site<R: Runner>(
+fn execute_site_impl<R: Runner>(
     directory: &Path,
     site: &Site,
     relative: &str,
     runner: &R,
     cfg: &MutantRunConfig<'_>,
+    work_dir: &Path,
+    restore_after: bool,
 ) -> String {
     let slice_ok = cfg
         .original
@@ -803,17 +830,27 @@ pub fn execute_site<R: Runner>(
     if std::fs::write(&destination, &mutated).is_err() {
         return "survived".to_string();
     }
-    let _guard = RestoreGuard {
+    let _guard = restore_after.then(|| RestoreGuard {
         destination: &destination,
         original: cfg.original,
-    };
-    let work_dir = mapped_cwd(directory, cfg.root, cfg.cwd);
-    let result = runner.run(cfg.command, &work_dir, Some(cfg.timeout));
+    });
+    let result = runner.run(cfg.command, work_dir, Some(cfg.timeout));
     if result.timed_out || result.code != 0 {
         "killed".to_string()
     } else {
         "survived".to_string()
     }
+}
+
+pub fn execute_site<R: Runner>(
+    directory: &Path,
+    site: &Site,
+    relative: &str,
+    runner: &R,
+    cfg: &MutantRunConfig<'_>,
+) -> String {
+    let work_dir = mapped_cwd(directory, cfg.root, cfg.cwd);
+    execute_site_impl(directory, site, relative, runner, cfg, &work_dir, true)
 }
 
 fn prune_empty_run_parents(base: &Path) {
@@ -850,7 +887,7 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
         return Ok(());
     }
     let root_resolved = resolve_path(cfg.root);
-    let base = new_run_dir(&root_resolved)?;
+    let base = acquire_run_dir(&root_resolved)?;
     let mut cleanup = RunDirCleanup(Some(&base));
 
     let relative = relative_posix(source, &root_resolved)
@@ -874,6 +911,7 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
             let queue_ref = &queue;
             let results_ref = &results;
             let rel_ref = relative.as_str();
+            let work_dir = mapped_cwd(directory, &root_resolved, cfg.cwd);
             scope.spawn(move || {
                 loop {
                     let next_site = {
@@ -886,7 +924,8 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
                     if runner.is_verbose() {
                         eprintln!("{}:{} {}", cfg.file_key, site.line, site.description());
                     }
-                    let status = execute_site(directory, site, rel_ref, runner, cfg);
+                    let status =
+                        execute_site_impl(directory, site, rel_ref, runner, cfg, &work_dir, false);
                     let mut out_guard = results_ref.lock().expect("results lock");
                     out_guard.push((site.mutation_id.clone(), status));
                 }
@@ -1140,6 +1179,7 @@ mod tests {
         let root = temp_dir("parallel_workers");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("package.json"), "{\"name\":\"demo\"}\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
         let target = root.join("src").join("calc.ts");
         std::fs::write(&target, "export const v = 1;\n").unwrap();
         std::fs::write(
@@ -1156,6 +1196,18 @@ mod tests {
         for (idx, w) in workers.iter().enumerate() {
             assert!(w.ends_with(format!("worker-{idx}")));
             assert!(w.join("package.json").is_file());
+            assert!(
+                !std::fs::symlink_metadata(w.join("package.json"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                std::fs::symlink_metadata(w.join("pnpm-lock.yaml"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
             assert!(
                 !std::fs::symlink_metadata(w.join("src").join("calc.ts"))
                     .unwrap()
@@ -1178,6 +1230,121 @@ mod tests {
 
         delete_tree(&base).unwrap();
         assert!(!base.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_mutants_reuses_stable_run_active_and_isolates_sequential_sites() {
+        type RecordedRuns = std::sync::Arc<Mutex<Vec<(PathBuf, Vec<u8>)>>>;
+        struct CaptureRunner {
+            seen_run_dirs: RecordedRuns,
+            relative: String,
+        }
+        impl Runner for CaptureRunner {
+            fn is_verbose(&self) -> bool {
+                false
+            }
+            fn run(&self, _command: &Command, cwd: &Path, _timeout: Option<f64>) -> CommandResult {
+                let bytes = std::fs::read(cwd.join(&self.relative)).unwrap();
+                self.seen_run_dirs
+                    .lock()
+                    .unwrap()
+                    .push((cwd.to_path_buf(), bytes));
+                CommandResult {
+                    code: 1,
+                    timed_out: false,
+                    seconds: 0.01,
+                    output: String::new(),
+                }
+            }
+        }
+
+        let root = temp_dir("stable_run_active");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src_path = root.join("src").join("ops.py");
+        let original = b"def ops(a, b):\n    x = a + b\n    return x * 2\n";
+        std::fs::write(&src_path, original).unwrap();
+
+        // Pre-seed a stale run-active leftover to ensure acquire_run_dir clears and reuses it.
+        let stale = root
+            .join("target")
+            .join("mutation-workers")
+            .join("run-active");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("stale.txt"), "old").unwrap();
+
+        let plus_pos = original.iter().position(|&b| b == b'+').unwrap();
+        let mul_pos = original.iter().position(|&b| b == b'*').unwrap();
+        let sites = vec![
+            Site {
+                file: "src/ops.py".into(),
+                namespace: "ops".into(),
+                form_id: "defn/ops".into(),
+                name: "ops".into(),
+                line: 2,
+                start: plus_pos,
+                end: plus_pos + 1,
+                original: "+".into(),
+                mutant: "-".into(),
+                category: "arithmetic".into(),
+                mutation_id: "m1".into(),
+                anchor_line: 2,
+            },
+            Site {
+                file: "src/ops.py".into(),
+                namespace: "ops".into(),
+                form_id: "defn/ops".into(),
+                name: "ops".into(),
+                line: 3,
+                start: mul_pos,
+                end: mul_pos + 1,
+                original: "*".into(),
+                mutant: "/".into(),
+                category: "arithmetic".into(),
+                mutation_id: "m2".into(),
+                anchor_line: 3,
+            },
+        ];
+
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let runner = CaptureRunner {
+            seen_run_dirs: seen.clone(),
+            relative: "src/ops.py".into(),
+        };
+        let cmd = Command::Argv(vec!["pytest".into()]);
+        let cfg = MutantRunConfig {
+            root: &root,
+            original,
+            command: &cmd,
+            cwd: &root,
+            timeout: 5.0,
+            file_key: "src/ops.py",
+        };
+        let mut outcomes = HashMap::new();
+        run_mutants(&src_path, &sites, Some(1), &runner, &cfg, &mut outcomes).unwrap();
+
+        assert_eq!(outcomes.get("m1").map(String::as_str), Some("killed"));
+        assert_eq!(outcomes.get("m2").map(String::as_str), Some("killed"));
+
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        for (cwd, bytes) in recorded.iter() {
+            assert_eq!(
+                cwd.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str()),
+                Some("run-active")
+            );
+            assert!(!cwd.join("stale.txt").exists());
+            let text = std::str::from_utf8(bytes).unwrap();
+            assert_ne!(bytes.as_slice(), original);
+            // Verify one mutant never leaks into the next site when restore_after == false.
+            assert!(!(text.contains("a - b") && text.contains("x / 2")));
+        }
+
+        assert!(!stale.exists());
+        assert!(!root.join("target").exists());
+        assert_eq!(std::fs::read(&src_path).unwrap(), original);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1207,7 +1374,9 @@ mod tests {
         if std::env::var_os(SUBPROC_ENV).is_some() {
             match std::env::var(MODE_ENV).as_deref() {
                 Ok("default") => {
-                    assert_eq!(worker_count_for(100, 16, None), 4);
+                    let expected = if cfg!(windows) { 2 } else { 4 };
+                    assert_eq!(ub_runtime::default_mutator_workers(16), expected);
+                    assert_eq!(worker_count_for(100, 16, None), expected);
                     assert_eq!(worker_count_for(2, 16, None), 2);
                     assert_eq!(worker_count_for(0, 16, None), 1);
                     assert_eq!(worker_count_for(100, 16, Some(12)), 12);
