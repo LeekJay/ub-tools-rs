@@ -265,9 +265,12 @@ fn json_outputs_empty_scan_and_mutate_exit_codes_cleanly() {
     );
     assert_eq!(killed.status.code(), Some(0));
     let killed_stdout = String::from_utf8(killed.stdout).unwrap();
+    let killed_stderr = String::from_utf8_lossy(&killed.stderr);
     assert!(!killed_stdout.contains("KILLED"));
     assert!(!killed_stdout.contains("Wrote"));
-    assert!(String::from_utf8_lossy(&killed.stderr).contains("Wrote "));
+    assert!(killed_stderr.contains("Mutating src/demo.py (1 site, 1 worker)"));
+    assert!(killed_stderr.contains("[1/1] KILLED   src/demo.py:3 "));
+    assert!(killed_stderr.contains("Wrote "));
     let killed_val: serde_json::Value = serde_json::from_str(&killed_stdout).unwrap();
     assert_eq!(killed_val["mode"], "mutate");
     assert_eq!(killed_val["summary"]["baseline_failed"], false);
@@ -294,8 +297,13 @@ fn json_outputs_empty_scan_and_mutate_exit_codes_cleanly() {
     );
     assert_eq!(survived.status.code(), Some(3));
     let survived_stdout = String::from_utf8(survived.stdout).unwrap();
+    let survived_stderr = String::from_utf8_lossy(&survived.stderr);
     assert!(!survived_stdout.contains("SURVIVED"));
     let survived_val: serde_json::Value = serde_json::from_str(&survived_stdout).unwrap();
+    let total = survived_val["summary"]["sites"].as_u64().unwrap();
+    assert!(survived_stderr.contains(&format!("Mutating src/demo.py ({total} sites, 1 worker)")));
+    assert!(survived_stderr.contains(&format!("[{total}/{total}] ")));
+    assert!(survived_stderr.contains("SURVIVED src/demo.py:"));
     assert!(survived_val["summary"]["survived"].as_u64().unwrap() >= 1);
     assert!(survived_val["summary"]["score"].as_f64().unwrap() < 1.0);
     assert!(

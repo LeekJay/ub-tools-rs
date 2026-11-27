@@ -23,7 +23,7 @@ Acts strictly as an objective verifier (never modifying code, installing tools, 
 | --- | --- | --- |
 | Complexity | [`crapper`](../../crates/crapper) | `--no-metrics --json`, scoped with `--changed` or explicit paths (`--use-existing-coverage` when fresh coverage is on disk) |
 | Duplication | [`dryer`](../../crates/dryer) | `--no-metrics --json --threshold 0.8` across the relevant source root, focusing findings on changed files |
-| Mutation sites | [`mutator`](../../crates/mutator) | `--scan --json` (`--changed` or explicit paths) read-only first, then `--json` for targeted mutation runs (writes `.metrics/mutate/*.edn`) |
+| Mutation sites | [`mutator`](../../crates/mutator) | `--scan --json` first to filter out non-decision lines, then `--lines`, scoped `--test-command` for slow runners, and `--json` (streams live progress on `stderr`, writes `.metrics/mutate/*.edn`) |
 
 ## Installation
 

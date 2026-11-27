@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -799,6 +800,12 @@ pub struct MutantRunConfig<'a> {
     pub file_key: &'a str,
 }
 
+struct SiteRunOutcome {
+    status: String,
+    label: &'static str,
+    seconds: f64,
+}
+
 fn execute_site_impl<R: Runner>(
     directory: &Path,
     site: &Site,
@@ -807,7 +814,7 @@ fn execute_site_impl<R: Runner>(
     cfg: &MutantRunConfig<'_>,
     work_dir: &Path,
     restore_after: bool,
-) -> String {
+) -> SiteRunOutcome {
     let slice_ok = cfg
         .original
         .get(site.start..site.end)
@@ -820,25 +827,51 @@ fn execute_site_impl<R: Runner>(
             line = site.line,
             desc = site.description()
         );
-        return "survived".to_string();
+        return SiteRunOutcome {
+            status: "survived".to_string(),
+            label: "SKIPPED",
+            seconds: 0.0,
+        };
     }
 
     let destination = directory.join(relative);
     let Ok(mutated) = apply_site_bytes(cfg.original, site.start, site.end, &site.mutant) else {
-        return "survived".to_string();
+        return SiteRunOutcome {
+            status: "survived".to_string(),
+            label: "SKIPPED",
+            seconds: 0.0,
+        };
     };
     if std::fs::write(&destination, &mutated).is_err() {
-        return "survived".to_string();
+        return SiteRunOutcome {
+            status: "survived".to_string(),
+            label: "SKIPPED",
+            seconds: 0.0,
+        };
     }
     let _guard = restore_after.then(|| RestoreGuard {
         destination: &destination,
         original: cfg.original,
     });
     let result = runner.run(cfg.command, work_dir, Some(cfg.timeout));
-    if result.timed_out || result.code != 0 {
-        "killed".to_string()
+    if result.timed_out {
+        SiteRunOutcome {
+            status: "killed".to_string(),
+            label: "TIMEOUT",
+            seconds: result.seconds,
+        }
+    } else if result.code != 0 {
+        SiteRunOutcome {
+            status: "killed".to_string(),
+            label: "KILLED",
+            seconds: result.seconds,
+        }
     } else {
-        "survived".to_string()
+        SiteRunOutcome {
+            status: "survived".to_string(),
+            label: "SURVIVED",
+            seconds: result.seconds,
+        }
     }
 }
 
@@ -850,7 +883,7 @@ pub fn execute_site<R: Runner>(
     cfg: &MutantRunConfig<'_>,
 ) -> String {
     let work_dir = mapped_cwd(directory, cfg.root, cfg.cwd);
-    execute_site_impl(directory, site, relative, runner, cfg, &work_dir, true)
+    execute_site_impl(directory, site, relative, runner, cfg, &work_dir, true).status
 }
 
 fn prune_empty_run_parents(base: &Path) {
@@ -903,6 +936,15 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
         &importers,
     )?;
 
+    let total = sites.len();
+    let site_word = if total == 1 { "site" } else { "sites" };
+    let worker_word = if count == 1 { "worker" } else { "workers" };
+    eprintln!(
+        "Mutating {} ({total} {site_word}, {count} {worker_word})",
+        cfg.file_key
+    );
+    let completed = AtomicUsize::new(0);
+
     let queue: Mutex<VecDeque<&Site>> = Mutex::new(sites.iter().collect());
     let results: Mutex<Vec<(String, String)>> = Mutex::new(Vec::with_capacity(sites.len()));
 
@@ -910,6 +952,7 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
         for directory in &directories {
             let queue_ref = &queue;
             let results_ref = &results;
+            let completed_ref = &completed;
             let rel_ref = relative.as_str();
             let work_dir = mapped_cwd(directory, &root_resolved, cfg.cwd);
             scope.spawn(move || {
@@ -924,10 +967,19 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
                     if runner.is_verbose() {
                         eprintln!("{}:{} {}", cfg.file_key, site.line, site.description());
                     }
-                    let status =
+                    let outcome =
                         execute_site_impl(directory, site, rel_ref, runner, cfg, &work_dir, false);
+                    let done = completed_ref.fetch_add(1, Ordering::AcqRel) + 1;
+                    eprintln!(
+                        "[{done}/{total}] {:<8} {}:{} {} ({:.1}s)",
+                        outcome.label,
+                        cfg.file_key,
+                        site.line,
+                        site.description(),
+                        outcome.seconds,
+                    );
                     let mut out_guard = results_ref.lock().expect("results lock");
-                    out_guard.push((site.mutation_id.clone(), status));
+                    out_guard.push((site.mutation_id.clone(), outcome.status));
                 }
             });
         }
@@ -1031,6 +1083,80 @@ mod tests {
             &[b"def f():\r\n    return 1 - 2\r\n".to_vec()]
         );
         assert_eq!(std::fs::read(&worker_file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn execute_site_impl_reports_killed_survived_and_timeout_labels() {
+        struct StubOutcomeRunner {
+            code: i32,
+            timed_out: bool,
+            seconds: f64,
+        }
+        impl Runner for StubOutcomeRunner {
+            fn is_verbose(&self) -> bool {
+                false
+            }
+            fn run(&self, _command: &Command, _cwd: &Path, _timeout: Option<f64>) -> CommandResult {
+                CommandResult {
+                    code: self.code,
+                    timed_out: self.timed_out,
+                    seconds: self.seconds,
+                    output: String::new(),
+                }
+            }
+        }
+
+        let tmp = temp_dir("outcome_labels");
+        let root = tmp.join("root");
+        let worker = tmp.join("worker");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(worker.join("src")).unwrap();
+        let original = b"def f():\n    return 1 + 2\n";
+        let worker_file = worker.join("src").join("demo.py");
+        std::fs::write(&worker_file, original).unwrap();
+        let offset = original.iter().position(|&b| b == b'+').unwrap();
+        let site = Site {
+            file: "src/demo.py".into(),
+            namespace: "demo".into(),
+            form_id: "defn/f".into(),
+            name: "f".into(),
+            line: 2,
+            start: offset,
+            end: offset + 1,
+            original: "+".into(),
+            mutant: "-".into(),
+            category: "arithmetic".into(),
+            mutation_id: "m1".into(),
+            anchor_line: 2,
+        };
+        let cmd = Command::Argv(vec!["pytest".into()]);
+        let cfg = MutantRunConfig {
+            root: &root,
+            original,
+            command: &cmd,
+            cwd: &root,
+            timeout: 5.0,
+            file_key: "src/demo.py",
+        };
+
+        for (code, timed_out, seconds, expected_status, expected_label) in [
+            (1, false, 1.25, "killed", "KILLED"),
+            (0, false, 0.5, "survived", "SURVIVED"),
+            (0, true, 2.0, "killed", "TIMEOUT"),
+        ] {
+            let runner = StubOutcomeRunner {
+                code,
+                timed_out,
+                seconds,
+            };
+            let outcome =
+                execute_site_impl(&worker, &site, "src/demo.py", &runner, &cfg, &worker, true);
+            assert_eq!(outcome.status, expected_status);
+            assert_eq!(outcome.label, expected_label);
+            assert!((outcome.seconds - seconds).abs() < f64::EPSILON);
+        }
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

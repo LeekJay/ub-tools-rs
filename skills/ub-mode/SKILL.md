@@ -117,7 +117,8 @@ Every time you are asked to make a change follow:
 
 ## Mutator
 
-* Use the mutator tool (run `--scan --json` first to inspect sites, then pass `--json` with `--changed` or target paths when running mutations).
+* Use the mutator tool (run `--scan --json` first to inspect sites, exclude logging, telemetry, and non-decision boilerplate, then pass `--json` with `--lines` targeting only changed branch and decision logic).
+* When the default test suite is slow, pass `--test-command` scoped to the matching unit test file and narrow `--lines` so `selected_sites * single_run_seconds / workers` stays within ~2 to 3 minutes per pass.
 * Cover the uncovered.
 * Kill the survivors.
 * Delete dead code.
