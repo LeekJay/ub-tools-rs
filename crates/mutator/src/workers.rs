@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use regex::Regex;
@@ -907,6 +907,7 @@ impl Drop for RunDirCleanup<'_> {
 }
 
 /// Mutate `sites` in parallel overlays of `root`, reusing `ctx`'s cached import graph across files.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
     source: &Path,
     sites: &[Site],
@@ -915,6 +916,7 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
     cfg: &MutantRunConfig<'_>,
     outcomes: &mut HashMap<String, String>,
     ctx: &mut WorkerContext,
+    baseline_seconds: Option<f64>,
 ) -> std::io::Result<()> {
     if sites.is_empty() {
         return Ok(());
@@ -936,14 +938,24 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
         &importers,
     )?;
 
+    let started = Instant::now();
     let total = sites.len();
     let site_word = if total == 1 { "site" } else { "sites" };
     let worker_word = if count == 1 { "worker" } else { "workers" };
-    eprintln!(
-        "Mutating {} ({total} {site_word}, {count} {worker_word})",
-        cfg.file_key
-    );
+    match baseline_seconds {
+        Some(base_s) => eprintln!(
+            "[mutator] START {} ({total} {site_word}, {count} {worker_word}, baseline {base_s:.1}s)",
+            cfg.file_key
+        ),
+        None => eprintln!(
+            "[mutator] START {} ({total} {site_word}, {count} {worker_word})",
+            cfg.file_key
+        ),
+    }
     let completed = AtomicUsize::new(0);
+    let killed_count = AtomicUsize::new(0);
+    let survived_count = AtomicUsize::new(0);
+    let timeout_count = AtomicUsize::new(0);
 
     let queue: Mutex<VecDeque<&Site>> = Mutex::new(sites.iter().collect());
     let results: Mutex<Vec<(String, String)>> = Mutex::new(Vec::with_capacity(sites.len()));
@@ -953,6 +965,9 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
             let queue_ref = &queue;
             let results_ref = &results;
             let completed_ref = &completed;
+            let killed_ref = &killed_count;
+            let survived_ref = &survived_count;
+            let timeout_ref = &timeout_count;
             let rel_ref = relative.as_str();
             let work_dir = mapped_cwd(directory, &root_resolved, cfg.cwd);
             scope.spawn(move || {
@@ -969,9 +984,20 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
                     }
                     let outcome =
                         execute_site_impl(directory, site, rel_ref, runner, cfg, &work_dir, false);
+                    match outcome.label {
+                        "KILLED" => {
+                            killed_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                        "TIMEOUT" => {
+                            timeout_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            survived_ref.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let done = completed_ref.fetch_add(1, Ordering::AcqRel) + 1;
                     eprintln!(
-                        "[{done}/{total}] {:<8} {}:{} {} ({:.1}s)",
+                        "[mutator] [{done}/{total}] {:<8} {}:{} {} ({:.1}s)",
                         outcome.label,
                         cfg.file_key,
                         site.line,
@@ -984,6 +1010,15 @@ pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
             });
         }
     });
+
+    eprintln!(
+        "[mutator] DONE  {} (killed={}, survived={}, timeout={}, elapsed={:.1}s)",
+        cfg.file_key,
+        killed_count.load(Ordering::Relaxed),
+        survived_count.load(Ordering::Relaxed),
+        timeout_count.load(Ordering::Relaxed),
+        started.elapsed().as_secs_f64(),
+    );
 
     for (id, status) in results.into_inner().expect("results unwrap") {
         outcomes.insert(id, status);
@@ -1004,7 +1039,16 @@ pub fn run_mutants<R: Runner + Sync>(
     outcomes: &mut HashMap<String, String>,
 ) -> std::io::Result<()> {
     let mut ctx = WorkerContext::new();
-    run_mutants_with_context(source, sites, max_workers, runner, cfg, outcomes, &mut ctx)
+    run_mutants_with_context(
+        source,
+        sites,
+        max_workers,
+        runner,
+        cfg,
+        outcomes,
+        &mut ctx,
+        None,
+    )
 }
 
 #[cfg(test)]

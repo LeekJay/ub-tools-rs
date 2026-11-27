@@ -1107,6 +1107,38 @@ fn mutate_files<P: CliProvider + Sync>(
     for path in acc.written {
         eprintln!("Wrote {path}");
     }
+    let total_killed: usize = acc.forms.iter().map(|f| f.killed).sum();
+    let total_survived: usize = acc.forms.iter().map(|f| f.survived).sum();
+    let total_uncovered: usize = acc.forms.iter().map(|f| f.uncovered).sum();
+    if acc.baseline_failed {
+        eprintln!(
+            "[mutator] FAIL (exit 2): baseline tests failed before mutation. Fix failing tests first."
+        );
+    } else if acc.survived {
+        let word = if total_survived == 1 {
+            "mutant"
+        } else {
+            "mutants"
+        };
+        eprintln!(
+            "[mutator] FAIL (exit 3): {total_survived} {word} survived (killed={total_killed}, survived={total_survived}, uncovered={total_uncovered}). Review survived sites for missing test assertions or dead code."
+        );
+    } else if total_killed == 0 && total_uncovered > 0 {
+        eprintln!(
+            "[mutator] WARN (exit 0): 0 mutants executed ({total_uncovered} uncovered). Generate coverage or pass --no-coverage before treating as PASS."
+        );
+    } else if total_killed > 0 {
+        let word = if total_killed == 1 {
+            "mutant"
+        } else {
+            "mutants"
+        };
+        eprintln!(
+            "[mutator] PASS (exit 0): all {total_killed} tested {word} killed (uncovered={total_uncovered})."
+        );
+    } else {
+        eprintln!("[mutator] INFO (exit 0): 0 mutation sites executed.");
+    }
     finish(acc.baseline_failed, acc.survived)
 }
 

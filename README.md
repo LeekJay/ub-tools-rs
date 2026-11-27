@@ -92,7 +92,7 @@ Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\
 
 * **Per-repository `UBC1` caches** store parsed AST complexity records in `crapper`, compact 128-bit truncated SHA-256 subtree fingerprint hashes in `dryer`, and discovered mutation sites in `mutator`, placed outside repositories under the cache directory.
 * **Stamps and zero-write warm hits** invalidate per file via `(mtime_ns, size)` plus nearest `go.mod`, `Cargo.toml`, and `Package.swift` manifest stamps in `crapper` and `mutator`; warm runs with zero misses skip rewriting cache files and keep exact stdout parity.
-* **Bypass, live progress, and JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`), stream per-site `mutator` progress to `stderr`, support function-level `crapper --changed-functions` (implicitly `--no-metrics`, optional `--base <ref>`, notes untouched over-threshold functions on `stderr`), and emit versioned `v1` JSON on `stdout` (including `start_line` and `end_line` in `crapper`) via `--json` with matching exit codes.
+* **Bypass, live progress, and JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`), stream `[mutator] START`, `[done/total]`, and `[mutator] DONE` progress plus unified `[crapper]`, `[dryer]`, and `[mutator]` `stderr` status verdicts, support function-level `crapper --changed-functions` (implicitly `--no-metrics`, optional `--base <ref>`), and emit versioned `v1` JSON on `stdout` (including `start_line` and `end_line` in `crapper`) via `--json` with matching exit codes.
 
 ### Core Rust optimizations
 

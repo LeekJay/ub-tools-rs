@@ -303,14 +303,15 @@ fn warn_uncovered(
         return;
     }
     eprintln!(
-        "No coverage data for {file_key}; its sites are uncovered. Pass --no-coverage to run them anyway."
+        "[mutator] WARN: no coverage data for {file_key} ({} sites marked uncovered; generate coverage or pass --no-coverage).",
+        found.len()
     );
 }
 
 fn warn_many(file_key: &str, selected: &[Site], mutation_warning: i64) {
     if (selected.len() as i64) > mutation_warning {
         eprintln!(
-            "WARNING: {} covered mutations selected in {file_key}.",
+            "[mutator] WARN: {} mutations selected in {file_key} (exceeds warning limit {mutation_warning}; use --lines to batch decision lines).",
             selected.len()
         );
     }
@@ -604,6 +605,7 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
                 &run_cfg,
                 &mut outcomes,
                 ctx,
+                Some(seconds),
             ),
             None => run_mutants(
                 &path,

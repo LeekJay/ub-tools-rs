@@ -505,19 +505,74 @@ fn coverage_bundle(options: &Options, root: &Path, files: &[PathBuf]) -> Option<
     Some(load_bundle(root))
 }
 
+fn fn_word(count: usize) -> &'static str {
+    if count == 1 { "function" } else { "functions" }
+}
+
 fn threshold_status(options: &Options, entries: &[Entry], err: &mut dyn Write) -> i32 {
+    let total = entries.len();
+    let scored_count = entries.iter().filter(|e| e.crap.is_some()).count();
+    let worst_scored = entries
+        .iter()
+        .filter_map(|e| e.crap.map(|crap| (crap, e)))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+
     let Some(threshold) = options.threshold else {
+        if let Some((max_crap, worst)) = worst_scored {
+            let word = fn_word(scored_count);
+            let _ = writeln!(
+                err,
+                "[crapper] INFO (exit 0): {scored_count} {word} scored (worst: {}:{} {} CRAP={max_crap:.1}; no --threshold set).",
+                worst.path, worst.start_line, worst.name,
+            );
+        } else if !entries.is_empty() {
+            let word = fn_word(total);
+            let max_cc = entries.iter().map(|e| e.complexity).max().unwrap_or(0);
+            let _ = writeln!(
+                err,
+                "[crapper] INFO (exit 0): {total} {word} analyzed without coverage (CRAP=N/A; max CC={max_cc})."
+            );
+        }
         return 0;
     };
-    let worst = entries.iter().filter_map(|e| e.crap).max_by(f64::total_cmp);
-    if let Some(max_crap) = worst
+
+    let over_count = entries
+        .iter()
+        .filter(|e| e.crap.is_some_and(|c| c > threshold))
+        .count();
+    if let Some((max_crap, worst)) = worst_scored
         && max_crap > threshold
     {
+        let word = fn_word(over_count);
+        let cov_text = worst
+            .coverage
+            .map(|c| format!("{c:.1}%"))
+            .unwrap_or_else(|| "N/A".to_string());
         let _ = writeln!(
             err,
-            "CRAP threshold exceeded: {max_crap:.1} > {threshold:.1}"
+            "[crapper] FAIL (exit 2): CRAP threshold exceeded: {max_crap:.1} > {threshold:.1} ({over_count}/{total} {word} over limit; worst: {}:{} {} CRAP={max_crap:.1} CC={} cov={cov_text}). Split complex functions or add tests.",
+            worst.path, worst.start_line, worst.name, worst.complexity,
         );
         return 2;
+    }
+    if let Some((max_crap, worst)) = worst_scored {
+        let word = fn_word(scored_count);
+        let _ = writeln!(
+            err,
+            "[crapper] PASS (exit 0): all {scored_count} scored {word} <= CRAP {threshold:.1} (worst: {}:{} {} CRAP={max_crap:.1}).",
+            worst.path, worst.start_line, worst.name,
+        );
+    } else if !entries.is_empty() {
+        let word = fn_word(total);
+        let _ = writeln!(
+            err,
+            "[crapper] WARN (exit 0): {total} {word} analyzed without coverage (CRAP=N/A; --threshold {threshold:.1} not evaluated)."
+        );
+    } else {
+        let _ = writeln!(
+            err,
+            "[crapper] PASS (exit 0): 0 functions scored (threshold <= {threshold:.1})."
+        );
     }
     0
 }
@@ -549,6 +604,7 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
         } else {
             let _ = writeln!(out, "No source files to analyze.");
         }
+        let _ = writeln!(err, "[crapper] INFO (exit 0): 0 matching source files.");
         return 0;
     }
 
@@ -558,7 +614,7 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     let mut entries =
         analyze_resolved_files_with_cache(&files, &root, bundle.as_mut(), !options.no_cache);
     let mut untouched_over_threshold = 0usize;
-    let mut untouched_worst: Option<f64> = None;
+    let mut untouched_worst: Option<(String, usize, String, f64)> = None;
     if let Some(ref changed_map) = selection.lines_by_path {
         let mut kept = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -569,7 +625,12 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
                 && crap > threshold
             {
                 untouched_over_threshold += 1;
-                untouched_worst = Some(untouched_worst.map_or(crap, |w| w.max(crap)));
+                let replace = untouched_worst
+                    .as_ref()
+                    .is_none_or(|(_, _, _, worst)| crap > *worst);
+                if replace {
+                    untouched_worst = Some((entry.path, entry.start_line, entry.name, crap));
+                }
             }
         }
         entries = kept;
@@ -596,16 +657,13 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
         let _ = writeln!(err, "Wrote {}", metrics.display());
     }
     if untouched_over_threshold > 0
-        && let (Some(threshold), Some(worst)) = (options.threshold, untouched_worst)
+        && let (Some(threshold), Some((u_path, u_line, u_name, u_crap))) =
+            (options.threshold, untouched_worst)
     {
-        let fn_word = if untouched_over_threshold == 1 {
-            "function"
-        } else {
-            "functions"
-        };
+        let word = fn_word(untouched_over_threshold);
         let _ = writeln!(
             err,
-            "Note: {untouched_over_threshold} untouched {fn_word} in changed files exceed CRAP {threshold:.1} (worst {worst:.1})."
+            "[crapper] INFO (non-blocking, not in exit code): {untouched_over_threshold} untouched {word} in changed files exceed CRAP {threshold:.1} (worst: {u_path}:{u_line} {u_name} CRAP={u_crap:.1}). Existing tech debt only; record in Limitations, do not fail this change."
         );
     }
     threshold_status(&options, &entries, err)
@@ -852,6 +910,10 @@ mod tests {
             &mut err,
         );
         assert_eq!(code, 0);
+        assert!(
+            String::from_utf8_lossy(&err)
+                .contains("[crapper] INFO (exit 0): 0 matching source files.")
+        );
         let empty_json: serde_json::Value =
             serde_json::from_slice(&out).expect("empty --json stdout should parse");
         assert_eq!(empty_json["version"], 1);
@@ -891,15 +953,23 @@ mod tests {
         assert_eq!(exceeded_val["summary"]["threshold"], 5.0);
         assert_eq!(exceeded_val["summary"]["threshold_exceeded"], true);
         assert_eq!(exceeded_val["entries"][0]["name"], "branchy");
-        assert!(exceeded_err.contains("CRAP threshold exceeded:"));
+        assert!(exceeded_err.contains("[crapper] FAIL (exit 2): CRAP threshold exceeded:"));
+        assert!(exceeded_err.contains("worst:"));
         assert!(!metrics_path(&scored_dir.0).exists());
 
-        let (ok_code, ok_out, _) = run_fixture_cli(&scored_dir, &["--json"], "10.0");
+        let (ok_code, ok_out, ok_err) = run_fixture_cli(&scored_dir, &["--json"], "10.0");
         assert_eq!(ok_code, 0);
         let ok_val: serde_json::Value =
             serde_json::from_str(&ok_out).expect("valid json below threshold");
         assert_eq!(ok_val["summary"]["threshold_exceeded"], false);
+        assert!(ok_err.contains("[crapper] PASS (exit 0): all 1 scored function <= CRAP 10.0"));
         assert!(metrics_path(&scored_dir.0).is_file());
+
+        let (nocov_code, _, nocov_err) =
+            run_fixture_cli(&scored_dir, &["--no-coverage", "--no-metrics"], "10.0");
+        assert_eq!(nocov_code, 0);
+        assert!(nocov_err.contains("[crapper] WARN (exit 0):"));
+        assert!(nocov_err.contains("not evaluated"));
     }
 
     #[test]
@@ -1096,8 +1166,12 @@ mod tests {
             "--changed-functions must imply --no-metrics and not write .metrics/crap.edn"
         );
         assert!(
-            fn_err.contains("Note: 1 untouched function in changed files exceed CRAP 10.0 (worst "),
+            fn_err.contains("[crapper] INFO (non-blocking, not in exit code): 1 untouched function in changed files exceed CRAP 10.0 (worst: src/app.py:2 legacy_giant CRAP="),
             "expected untouched legacy reminder in stderr, got: {fn_err}"
+        );
+        assert!(
+            fn_err.contains("[crapper] PASS (exit 0): all 1 scored function <= CRAP 10.0"),
+            "expected pass verdict in stderr, got: {fn_err}"
         );
         let fn_json: serde_json::Value = serde_json::from_str(&fn_out).unwrap();
         assert_eq!(fn_json["summary"]["functions"], 1);
@@ -1109,7 +1183,7 @@ mod tests {
             run_fixture_cli(&dir, &["--changed-functions", "--json"], "100.0");
         assert_eq!(high_code, 0);
         assert!(
-            !high_err.contains("Note:"),
+            !high_err.contains("non-blocking"),
             "unexpected reminder below high threshold: {high_err}"
         );
 

@@ -512,12 +512,46 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
             return git_err.code;
         }
     };
+    fn write_dryer_summary(
+        err: &mut dyn Write,
+        candidates: &[super::model::Duplicate],
+        entries_scanned: usize,
+        threshold: f64,
+    ) {
+        if candidates.is_empty() {
+            let _ = writeln!(
+                err,
+                "[dryer] PASS (exit 0): 0 duplicate pairs >= {threshold:.2} ({entries_scanned} forms scanned)."
+            );
+            return;
+        }
+        let count = candidates.len();
+        let pair_word = if count == 1 { "pair" } else { "pairs" };
+        if let Some(top) = candidates.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+            let _ = writeln!(
+                err,
+                "[dryer] FOUND (exit 0, review required): {count} duplicate {pair_word} >= {threshold:.2} ({entries_scanned} forms scanned; top: score={:.2} {}:{}-{} <-> {}:{}-{}). Exit 0 does not mean clean; inspect stdout candidates.",
+                top.score,
+                top.left.file,
+                top.left.start_line,
+                top.left.end_line,
+                top.right.file,
+                top.right.start_line,
+                top.right.end_line,
+            );
+        }
+    }
+
     if files.is_empty() {
         if options.format == "json" {
             let _ = write!(out, "{}", format_json(&[], 0, options.threshold));
         } else {
             let _ = writeln!(out, "No source files to analyze.");
         }
+        let _ = writeln!(
+            err,
+            "[dryer] PASS (exit 0): 0 source files matched (0 duplicates)."
+        );
         return 0;
     }
 
@@ -532,7 +566,7 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
         !options.no_cache,
     );
     for warning in warnings {
-        let _ = writeln!(err, "dryer: {warning}");
+        let _ = writeln!(err, "[dryer] WARN: {warning}");
     }
     if options.no_metrics {
         let _ = write!(
@@ -545,6 +579,7 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
                 &options.format
             )
         );
+        write_dryer_summary(err, &candidates, entries_scanned, options.threshold);
         return 0;
     }
     match write_metrics(&candidates, &root) {
@@ -560,6 +595,7 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
                 )
             );
             let _ = writeln!(err, "Wrote {}", metrics.display());
+            write_dryer_summary(err, &candidates, entries_scanned, options.threshold);
             0
         }
         Err(io_err) => {
@@ -957,6 +993,8 @@ mod tests {
             let mut err = Vec::new();
             let code = run_with_writers(&args, &mut out, &mut err);
             assert_eq!(code, 0);
+            let empty_err_str = String::from_utf8(err).unwrap();
+            assert!(empty_err_str.contains("[dryer] PASS (exit 0): 0 source files matched"));
             let out_str = String::from_utf8(out).unwrap();
             assert!(out_str.ends_with('\n'));
             let json: serde_json::Value = serde_json::from_str(&out_str).unwrap();
@@ -973,6 +1011,11 @@ mod tests {
             run_fixture_scan(dir.path(), &["--json", "--no-metrics", "--no-cache"]);
         assert_eq!(code_no_metrics, 0);
         assert!(!err_no_metrics.contains("Wrote "));
+        assert!(
+            err_no_metrics
+                .contains("[dryer] FOUND (exit 0, review required): 1 duplicate pair >= 0.82")
+        );
+        assert!(err_no_metrics.contains("Exit 0 does not mean clean"));
         assert!(!dir.path().join(".metrics").exists());
         let val: serde_json::Value = serde_json::from_str(&out_no_metrics).unwrap();
         assert_eq!(val["version"], 1);
@@ -986,6 +1029,10 @@ mod tests {
             run_fixture_scan(dir.path(), &["--format", "json", "--no-cache"]);
         assert_eq!(code_with_metrics, 0);
         assert!(err_with_metrics.contains("Wrote "));
+        assert!(
+            err_with_metrics
+                .contains("[dryer] FOUND (exit 0, review required): 1 duplicate pair >= 0.82")
+        );
         assert!(dir.path().join(".metrics").join("dry.edn").is_file());
         let val2: serde_json::Value = serde_json::from_str(&out_with_metrics).unwrap();
         assert_eq!(val2, val);
