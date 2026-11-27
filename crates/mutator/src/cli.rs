@@ -1012,6 +1012,21 @@ fn finish(baseline_failed: bool, survived: bool) -> i32 {
     0
 }
 
+fn log_written_paths(written: &[String], out: &mut dyn IoWrite) {
+    if written.len() <= 3 {
+        for path in written {
+            let _ = writeln!(out, "Wrote {path}");
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "[mutator] Wrote {} metrics files under .metrics/mutate/ (first: {}).",
+            written.len(),
+            written[0]
+        );
+    }
+}
+
 fn mutate_files<P: CliProvider + Sync>(
     options: &Options,
     root: &Path,
@@ -1091,6 +1106,8 @@ fn mutate_files<P: CliProvider + Sync>(
     }
 
     session.save_misses(misses, &active_keys);
+    let mut seen_written = HashSet::with_capacity(acc.written.len());
+    acc.written.retain(|path| seen_written.insert(path.clone()));
 
     if options.json {
         let report = MutateReport {
@@ -1104,9 +1121,7 @@ fn mutate_files<P: CliProvider + Sync>(
     } else if !acc.forms.is_empty() {
         write_stdout_bytes(format_results(&acc.forms).as_bytes());
     }
-    for path in acc.written {
-        eprintln!("Wrote {path}");
-    }
+    log_written_paths(&acc.written, &mut std::io::stderr());
     let total_killed: usize = acc.forms.iter().map(|f| f.killed).sum();
     let total_survived: usize = acc.forms.iter().map(|f| f.survived).sum();
     let total_uncovered: usize = acc.forms.iter().map(|f| f.uncovered).sum();
@@ -1652,6 +1667,33 @@ mod tests {
         assert_eq!(
             ub_runtime::file_mtime_size(&cache_path).unwrap(),
             stamp_before
+        );
+    }
+
+    #[test]
+    fn log_written_paths_prints_up_to_three_individually_and_compacts_many() {
+        let mut small = Vec::new();
+        log_written_paths(
+            &["a.edn".into(), "b.edn".into(), "c.edn".into()],
+            &mut small,
+        );
+        let small_str = String::from_utf8(small).unwrap();
+        assert_eq!(small_str, "Wrote a.edn\nWrote b.edn\nWrote c.edn\n");
+
+        let mut many = Vec::new();
+        log_written_paths(
+            &[
+                "a.edn".into(),
+                "b.edn".into(),
+                "c.edn".into(),
+                "d.edn".into(),
+            ],
+            &mut many,
+        );
+        let many_str = String::from_utf8(many).unwrap();
+        assert_eq!(
+            many_str,
+            "[mutator] Wrote 4 metrics files under .metrics/mutate/ (first: a.edn).\n"
         );
     }
 }

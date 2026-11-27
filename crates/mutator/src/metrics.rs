@@ -329,6 +329,9 @@ fn mentions_file(data: &EdnValue, file_key: &str) -> bool {
     forms_of(data)
         .into_iter()
         .any(|form| form_file(form, data).as_deref() == Some(file_key))
+        || outcomes_of(data)
+            .keys()
+            .any(|mutation| mutation_file(mutation).as_deref() == Some(file_key))
 }
 
 type RetainedMap = BTreeMap<String, (Vec<EdnValue>, HashMap<String, String>)>;
@@ -535,7 +538,6 @@ pub fn write_results(
     let mut touched: BTreeSet<String> = BTreeSet::new();
     touched.extend(incoming.keys().cloned());
     touched.extend(previous);
-    touched.extend(retained.keys().cloned());
 
     let mut written = Vec::new();
     let mut canonical = HashSet::new();
@@ -938,6 +940,31 @@ mod tests {
 
         collect_tmp_files(&root.join(".metrics").join("mutate"), &mut tmps);
         assert!(tmps.is_empty(), "leftover tmp files after error: {tmps:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_results_leaves_unrelated_namespaces_untouched_and_unwritten() {
+        let root = temp_dir("unrelated_untouched");
+        let unrelated_path = snapshot_path(&root, "unrelated.ns").unwrap();
+        std::fs::create_dir_all(unrelated_path.parent().unwrap()).unwrap();
+        let unrelated_content = "{:version 1 :tested-at \"2020-01-01T00:00:00+00:00\" :source \"other.py\" :namespace \"unrelated.ns\" :outcomes {} :forms [{:id \"defn/keep\" :kind \"defn\" :file \"other.py\" :line 1 :end-line 3 :hash \"h-keep\" :killed 2 :survived 0 :uncovered 0 :sites 2}]}\n";
+        std::fs::write(&unrelated_path, unrelated_content).unwrap();
+
+        let written = write_results(
+            &root,
+            "a.py",
+            &[make_form("demo", "run", "a.py", "h1", 1, false)],
+            &HashMap::new(),
+        )
+        .expect("write demo namespace");
+
+        assert_eq!(written.len(), 1);
+        assert!(written[0].ends_with("demo.edn"), "got {written:?}");
+        assert_eq!(
+            std::fs::read_to_string(&unrelated_path).unwrap(),
+            unrelated_content
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
