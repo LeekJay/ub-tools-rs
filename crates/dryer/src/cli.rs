@@ -8,8 +8,8 @@ use std::process::Command;
 use super::discover::{
     SKIP_DIRS, TEST_DIRS, is_test_file, iter_source_files, language_of, resolve_path, to_posix,
 };
-use super::report::{format_text, render_edn, write_metrics};
-use super::scan::{find_duplicates, scan_files};
+use super::report::{format_json, format_text, render_edn, write_metrics};
+use super::scan::scan_and_find_duplicates_resolved;
 
 pub fn skipped_directory_text() -> String {
     let mut ordered: Vec<&str> = SKIP_DIRS.iter().chain(TEST_DIRS.iter()).copied().collect();
@@ -47,11 +47,14 @@ Options:
   --min-lines N                 Minimum source lines in a candidate form,
                                 default 4.
   --min-nodes N                 Minimum normalized syntax nodes, default 20.
-  --format F                    text or edn, default text.
+  --format F                    text, edn, or json, default text.
   --edn                         Same as --format edn.
   --text                        Same as --format text.
+  --json                        Same as --format json.
   --no-metrics                  Skip writing .metrics/dry.edn.
                                 Print report only.
+  --no-cache                    Skip reading and writing the AST fingerprint
+                                cache.
 
 Arguments:
   path              File or directory to compare. Test paths are included when
@@ -101,6 +104,7 @@ pub struct Options {
     pub format: String,
     pub changed: bool,
     pub no_metrics: bool,
+    pub no_cache: bool,
 }
 
 impl Default for Options {
@@ -118,6 +122,7 @@ impl Default for Options {
             format: "text".to_string(),
             changed: false,
             no_metrics: false,
+            no_cache: false,
         }
     }
 }
@@ -233,12 +238,20 @@ pub fn parse_args(args: &[String]) -> Options {
                 options.format = "text".to_string();
                 Ok(1)
             }
+            "--json" => {
+                options.format = "json".to_string();
+                Ok(1)
+            }
             "--changed" => {
                 options.changed = true;
                 Ok(1)
             }
             "--no-metrics" => {
                 options.no_metrics = true;
+                Ok(1)
+            }
+            "--no-cache" => {
+                options.no_cache = true;
                 Ok(1)
             }
             _ if arg.starts_with('-') => Err(format!("Unknown option: {arg}")),
@@ -260,7 +273,7 @@ pub fn parse_args(args: &[String]) -> Options {
         }
     }
 
-    if options.format != "text" && options.format != "edn" {
+    if !matches!(options.format.as_str(), "text" | "edn" | "json") {
         return Options {
             action: Action::Format,
             message: format!("Unknown format: {}\n", options.format),
@@ -269,8 +282,13 @@ pub fn parse_args(args: &[String]) -> Options {
         };
     }
 
-    if options.action == Action::Scan && ub_runtime::env_no_metrics() {
-        options.no_metrics = true;
+    if options.action == Action::Scan {
+        if ub_runtime::env_no_metrics() {
+            options.no_metrics = true;
+        }
+        if ub_runtime::env_no_cache() {
+            options.no_cache = true;
+        }
     }
 
     options
@@ -442,19 +460,23 @@ pub fn select_files(options: &Options) -> Result<Vec<PathBuf>, GitStatusError> {
     let (existing, filters) = positionals(&root, &options.positionals);
     let candidates = apply_filters(selected(options, &root, &existing)?, &filters);
     let mut unique = BTreeMap::new();
-    for path in candidates {
-        let resolved = resolve_path(&path);
+    for resolved in candidates {
         let key = to_posix(&resolved);
         unique.entry(key).or_insert(resolved);
     }
     Ok(unique.into_values().collect())
 }
 
-fn format_report(candidates: &[super::model::Duplicate], format: &str) -> String {
-    if format == "edn" {
-        render_edn(candidates)
-    } else {
-        format_text(candidates)
+fn format_report(
+    candidates: &[super::model::Duplicate],
+    entries_scanned: usize,
+    threshold: f64,
+    format: &str,
+) -> String {
+    match format {
+        "json" => format_json(candidates, entries_scanned, threshold),
+        "edn" => render_edn(candidates),
+        _ => format_text(candidates),
     }
 }
 
@@ -491,24 +513,52 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
         }
     };
     if files.is_empty() {
-        let _ = writeln!(out, "No source files to analyze.");
+        if options.format == "json" {
+            let _ = write!(out, "{}", format_json(&[], 0, options.threshold));
+        } else {
+            let _ = writeln!(out, "No source files to analyze.");
+        }
         return 0;
     }
 
     let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
 
-    let (entries, warnings) = scan_files(&files, &root, options.min_lines, options.min_nodes);
+    let (entries_scanned, candidates, warnings) = scan_and_find_duplicates_resolved(
+        &files,
+        &root,
+        options.min_lines,
+        options.min_nodes,
+        options.threshold,
+        !options.no_cache,
+    );
     for warning in warnings {
         let _ = writeln!(err, "dryer: {warning}");
     }
-    let candidates = find_duplicates(&entries, options.threshold);
     if options.no_metrics {
-        let _ = write!(out, "{}", format_report(&candidates, &options.format));
+        let _ = write!(
+            out,
+            "{}",
+            format_report(
+                &candidates,
+                entries_scanned,
+                options.threshold,
+                &options.format
+            )
+        );
         return 0;
     }
     match write_metrics(&candidates, &root) {
         Ok(metrics) => {
-            let _ = write!(out, "{}", format_report(&candidates, &options.format));
+            let _ = write!(
+                out,
+                "{}",
+                format_report(
+                    &candidates,
+                    entries_scanned,
+                    options.threshold,
+                    &options.format
+                )
+            );
             let _ = writeln!(err, "Wrote {}", metrics.display());
             0
         }
@@ -856,5 +906,182 @@ mod tests {
         run_no_metrics_subproc_case(Some(" true "), true);
         run_no_metrics_subproc_case(Some("0"), false);
         run_no_metrics_subproc_case(None, false);
+    }
+
+    #[test]
+    fn parses_json_and_no_cache_options_and_keeps_exit_code_2_for_unknown_format() {
+        assert!(!Options::default().no_cache);
+        let help = help_text();
+        assert!(help.contains("--json"));
+        assert!(help.contains("--no-cache"));
+        assert!(help.contains("json"));
+
+        let json_flag = parse_args(&s(&["--json"]));
+        assert_eq!(json_flag.action, Action::Scan);
+        assert_eq!(json_flag.exit_code, 0);
+        assert_eq!(json_flag.format, "json");
+
+        let format_json = parse_args(&s(&["--format", "json", "--no-cache"]));
+        assert_eq!(format_json.action, Action::Scan);
+        assert_eq!(format_json.exit_code, 0);
+        assert_eq!(format_json.format, "json");
+        assert!(format_json.no_cache);
+
+        let unknown_fmt = parse_args(&s(&["--format", "xml"]));
+        assert_eq!(unknown_fmt.action, Action::Format);
+        assert_eq!(unknown_fmt.exit_code, 2);
+        assert_eq!(unknown_fmt.message, "Unknown format: xml\n");
+    }
+
+    #[test]
+    fn json_output_handles_empty_files_and_candidate_matches() {
+        let empty_dir = std::env::temp_dir().join(format!(
+            "dryer-cli-empty-json-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let _empty_guard = TempDirGuard(empty_dir.clone());
+
+        for flag in [&["--json", "--no-metrics"][..], &["--format", "json"][..]] {
+            let mut args = vec![
+                "--root".to_string(),
+                empty_dir.to_str().unwrap().to_string(),
+            ];
+            args.extend(flag.iter().map(|x| (*x).to_string()));
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_with_writers(&args, &mut out, &mut err);
+            assert_eq!(code, 0);
+            let out_str = String::from_utf8(out).unwrap();
+            assert!(out_str.ends_with('\n'));
+            let json: serde_json::Value = serde_json::from_str(&out_str).unwrap();
+            assert_eq!(json["version"], 1);
+            assert_eq!(json["tool"], "dryer");
+            assert_eq!(json["threshold"], 0.82);
+            assert_eq!(json["summary"]["entries_scanned"], 0);
+            assert_eq!(json["summary"]["duplicates"], 0);
+            assert_eq!(json["candidates"].as_array().unwrap().len(), 0);
+        }
+
+        let dir = duplicate_clojure_fixture("cli-json");
+        let (code_no_metrics, out_no_metrics, err_no_metrics) =
+            run_fixture_scan(dir.path(), &["--json", "--no-metrics", "--no-cache"]);
+        assert_eq!(code_no_metrics, 0);
+        assert!(!err_no_metrics.contains("Wrote "));
+        assert!(!dir.path().join(".metrics").exists());
+        let val: serde_json::Value = serde_json::from_str(&out_no_metrics).unwrap();
+        assert_eq!(val["version"], 1);
+        assert_eq!(val["tool"], "dryer");
+        assert_eq!(val["summary"]["entries_scanned"], 2);
+        assert_eq!(val["summary"]["duplicates"], 1);
+        assert_eq!(val["candidates"][0]["language"], "clojure");
+        assert_eq!(val["candidates"][0]["score"], 1.0);
+
+        let (code_with_metrics, out_with_metrics, err_with_metrics) =
+            run_fixture_scan(dir.path(), &["--format", "json", "--no-cache"]);
+        assert_eq!(code_with_metrics, 0);
+        assert!(err_with_metrics.contains("Wrote "));
+        assert!(dir.path().join(".metrics").join("dry.edn").is_file());
+        let val2: serde_json::Value = serde_json::from_str(&out_with_metrics).unwrap();
+        assert_eq!(val2, val);
+    }
+
+    const NO_CACHE_SUBPROC: &str = "DRYER_CLI_NO_CACHE_SUBPROC";
+    const NO_CACHE_ENV_MODE: &str = "DRYER_CLI_NO_CACHE_MODE";
+
+    fn run_no_cache_subproc_case(env_val: Option<&str>, mode: &str) {
+        let cache_dir =
+            std::env::temp_dir().join(format!("dryer-cli-nocache-{mode}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let _guard = TempDirGuard(cache_dir.clone());
+
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "--exact",
+            "cli::tests::no_cache_flag_and_env_bypass_cache_in_isolated_subprocess",
+            "--nocapture",
+        ]);
+        cmd.env(NO_CACHE_SUBPROC, "1");
+        cmd.env(NO_CACHE_ENV_MODE, mode);
+        cmd.env("UB_TOOLS_CACHE_DIR", &cache_dir);
+        match env_val {
+            Some(v) => {
+                cmd.env("UB_TOOLS_NO_CACHE", v);
+            }
+            None => {
+                cmd.env_remove("UB_TOOLS_NO_CACHE");
+            }
+        }
+        let output = cmd.output().expect("spawn no-cache subprocess test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "no-cache subproc test failed for mode={mode}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn no_cache_flag_and_env_bypass_cache_in_isolated_subprocess() {
+        if std::env::var_os(NO_CACHE_SUBPROC).is_some() {
+            let mode = std::env::var(NO_CACHE_ENV_MODE).unwrap();
+            let dir = duplicate_clojure_fixture(&format!("nocache-{mode}"));
+            let cache_dir = ub_runtime::cache_dir();
+
+            match mode.as_str() {
+                "env_1" => {
+                    assert!(parse_args(&[]).no_cache);
+                    assert!(!parse_args(&s(&["--help"])).no_cache);
+                    assert!(!parse_args(&s(&["--format", "csv"])).no_cache);
+                    let (code, out, _) = run_fixture_scan(dir.path(), &["--json", "--no-metrics"]);
+                    assert_eq!(code, 0);
+                    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+                    assert_eq!(parsed["summary"]["duplicates"], 1);
+                    assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 0);
+                }
+                "cli_flag" => {
+                    assert!(!parse_args(&[]).no_cache);
+                    assert!(parse_args(&s(&["--no-cache"])).no_cache);
+                    let (code, out, _) =
+                        run_fixture_scan(dir.path(), &["--json", "--no-metrics", "--no-cache"]);
+                    assert_eq!(code, 0);
+                    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+                    assert_eq!(parsed["summary"]["duplicates"], 1);
+                    assert_eq!(std::fs::read_dir(&cache_dir).unwrap().count(), 0);
+                }
+                "warm_cli" => {
+                    let (code1, out1, _) =
+                        run_fixture_scan(dir.path(), &["--json", "--no-metrics"]);
+                    assert_eq!(code1, 0);
+                    let cache_files: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .collect();
+                    assert_eq!(cache_files.len(), 1);
+                    let stamp = ub_runtime::file_mtime_size(&cache_files[0]).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+
+                    let (code2, out2, _) =
+                        run_fixture_scan(dir.path(), &["--json", "--no-metrics"]);
+                    assert_eq!(code2, 0);
+                    assert_eq!(out1, out2);
+                    assert_eq!(ub_runtime::file_mtime_size(&cache_files[0]).unwrap(), stamp);
+                }
+                other => panic!("unexpected mode: {other}"),
+            }
+            return;
+        }
+
+        run_no_cache_subproc_case(Some("1"), "env_1");
+        run_no_cache_subproc_case(None, "cli_flag");
+        run_no_cache_subproc_case(None, "warm_cli");
     }
 }

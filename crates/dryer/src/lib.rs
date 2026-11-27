@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod astnorm;
+pub mod cache;
 pub mod cli;
 pub mod clojure_read;
 pub mod discover;

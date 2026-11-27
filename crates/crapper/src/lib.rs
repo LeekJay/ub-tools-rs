@@ -3,6 +3,7 @@
 pub use tree_sitter;
 
 pub mod analyze;
+pub mod cache;
 pub mod cli;
 pub mod coverage;
 pub mod crap;

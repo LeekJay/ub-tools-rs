@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::analyze::analyze_files;
+use crate::analyze::analyze_resolved_files_with_cache;
 use crate::coverage::{CoverageBundle, load_bundle};
 use crate::discover::{
     CLOJURE_TEST_SUFFIXES, GO_TEST_SUFFIX, JS_TEST_SUFFIXES, SKIP_DIRS, TEST_DIRS,
@@ -12,7 +12,7 @@ use crate::discover::{
 use crate::metrics::write_metrics;
 use crate::model::Entry;
 use crate::path_util::{resolve_path, to_posix};
-use crate::report::format_report;
+use crate::report::{format_json, format_report};
 use crate::runners::run_coverage;
 
 pub fn help_text() -> String {
@@ -58,6 +58,9 @@ Options:
                                 coverage tools, then read the reports it wrote.
   --no-metrics                  Skip writing .metrics/crap.edn. Print report only.
   --threshold <number>          Exit 2 when the worst CRAP score is above this.
+  --format <fmt>                Output format: text or json. Default: text.
+  --json                        Same as --format json.
+  --no-cache                    Disable incremental AST caching.
 
 Arguments:
   path              File or directory to analyze. Test paths are included when
@@ -106,6 +109,8 @@ pub struct Options {
     pub coverage_command: Option<String>,
     pub threshold: Option<f64>,
     pub changed: bool,
+    pub format: String,
+    pub no_cache: bool,
 }
 
 impl Default for Options {
@@ -123,7 +128,18 @@ impl Default for Options {
             coverage_command: None,
             threshold: None,
             changed: false,
+            format: "text".to_string(),
+            no_cache: false,
         }
+    }
+}
+
+fn help_error(msg: impl AsRef<str>, help: &str) -> Options {
+    Options {
+        action: "help".into(),
+        message: format!("{}\n\n{help}", msg.as_ref()),
+        exit_code: 1,
+        ..Options::default()
     }
 }
 
@@ -156,42 +172,21 @@ pub fn parse_args(args: &[String]) -> Options {
                     options.source_roots.push(val.to_string());
                     index += 2;
                 }
-                Err(msg) => {
-                    return Options {
-                        action: "help".into(),
-                        message: format!("{msg}\n\n{help}"),
-                        exit_code: 1,
-                        ..Options::default()
-                    };
-                }
+                Err(msg) => return help_error(msg, &help),
             },
             "--root" => match take_value(args, index, arg) {
                 Ok(val) => {
                     options.project_root = PathBuf::from(val);
                     index += 2;
                 }
-                Err(msg) => {
-                    return Options {
-                        action: "help".into(),
-                        message: format!("{msg}\n\n{help}"),
-                        exit_code: 1,
-                        ..Options::default()
-                    };
-                }
+                Err(msg) => return help_error(msg, &help),
             },
             "--coverage-command" => match take_value(args, index, arg) {
                 Ok(val) => {
                     options.coverage_command = Some(val.to_string());
                     index += 2;
                 }
-                Err(msg) => {
-                    return Options {
-                        action: "help".into(),
-                        message: format!("{msg}\n\n{help}"),
-                        exit_code: 1,
-                        ..Options::default()
-                    };
-                }
+                Err(msg) => return help_error(msg, &help),
             },
             "--threshold" => match take_value(args, index, arg) {
                 Ok(val) => match val.parse::<f64>() {
@@ -199,24 +194,25 @@ pub fn parse_args(args: &[String]) -> Options {
                         options.threshold = Some(num);
                         index += 2;
                     }
-                    _ => {
-                        return Options {
-                            action: "help".into(),
-                            message: format!("--threshold requires a number\n\n{help}"),
-                            exit_code: 1,
-                            ..Options::default()
-                        };
-                    }
+                    _ => return help_error("--threshold requires a number", &help),
                 },
-                Err(msg) => {
-                    return Options {
-                        action: "help".into(),
-                        message: format!("{msg}\n\n{help}"),
-                        exit_code: 1,
-                        ..Options::default()
-                    };
-                }
+                Err(msg) => return help_error(msg, &help),
             },
+            "--format" => match take_value(args, index, arg) {
+                Ok(val) => {
+                    options.format = val.to_string();
+                    index += 2;
+                }
+                Err(msg) => return help_error(msg, &help),
+            },
+            "--json" => {
+                options.format = "json".to_string();
+                index += 1;
+            }
+            "--no-cache" => {
+                options.no_cache = true;
+                index += 1;
+            }
             "--no-coverage" => {
                 options.no_coverage = true;
                 index += 1;
@@ -233,19 +229,16 @@ pub fn parse_args(args: &[String]) -> Options {
                 options.changed = true;
                 index += 1;
             }
-            s if s.starts_with('-') => {
-                return Options {
-                    action: "help".into(),
-                    message: format!("Unknown option: {s}\n\n{help}"),
-                    exit_code: 1,
-                    ..Options::default()
-                };
-            }
+            s if s.starts_with('-') => return help_error(format!("Unknown option: {s}"), &help),
             _ => {
                 options.positionals.push(arg.clone());
                 index += 1;
             }
         }
+    }
+
+    if options.format != "text" && options.format != "json" {
+        return help_error(format!("Unknown format: {}", options.format), &help);
     }
 
     if options.no_coverage
@@ -254,15 +247,16 @@ pub fn parse_args(args: &[String]) -> Options {
             .as_deref()
             .is_some_and(|s| !s.is_empty())
     {
-        return Options {
-            action: "help".into(),
-            message: format!("--no-coverage cannot be combined with --coverage-command\n\n{help}"),
-            exit_code: 1,
-            ..Options::default()
-        };
+        return help_error(
+            "--no-coverage cannot be combined with --coverage-command",
+            &help,
+        );
     }
 
     options.no_metrics = options.no_metrics || ub_runtime::env_no_metrics();
+    if options.action != "help" && ub_runtime::env_no_cache() {
+        options.no_cache = true;
+    }
     options
 }
 
@@ -415,8 +409,7 @@ pub fn select_files(options: &Options) -> Result<Vec<PathBuf>, GitError> {
     let (existing, filters) = positionals(&root, &options.positionals);
     let picked = apply_filters(selected(options, &root, &existing)?, &filters);
     let mut unique: BTreeSet<(String, PathBuf)> = BTreeSet::new();
-    for p in picked {
-        let resolved = resolve_path(&p);
+    for resolved in picked {
         unique.insert((to_posix(&resolved), resolved));
     }
     Ok(unique.into_iter().map(|(_, p)| p).collect())
@@ -487,14 +480,20 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
         }
     };
     if files.is_empty() {
-        let _ = writeln!(out, "No source files to analyze.");
+        if options.format == "json" {
+            let _ = write!(out, "{}", format_json(&[], options.threshold));
+            let _ = out.flush();
+        } else {
+            let _ = writeln!(out, "No source files to analyze.");
+        }
         return 0;
     }
 
     let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
 
     let mut bundle = coverage_bundle(&options, &root, &files);
-    let entries = analyze_files(&files, &root, bundle.as_mut());
+    let entries =
+        analyze_resolved_files_with_cache(&files, &root, bundle.as_mut(), !options.no_cache);
     let written_path = if options.no_metrics {
         None
     } else {
@@ -506,7 +505,12 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
             }
         }
     };
-    let _ = write!(out, "{}", format_report(&entries));
+    let report = if options.format == "json" {
+        format_json(&entries, options.threshold)
+    } else {
+        format_report(&entries)
+    };
+    let _ = write!(out, "{report}");
     let _ = out.flush();
     if let Some(metrics) = written_path {
         let _ = writeln!(err, "Wrote {}", metrics.display());
@@ -703,6 +707,178 @@ mod tests {
                     ("UB_TOOLS_NO_METRICS", env_val),
                     (SUBPROCESS_EXPECT_ENV, Some(expect)),
                 ],
+            );
+        }
+    }
+
+    #[test]
+    fn options_and_help_support_format_json_and_no_cache() {
+        let defaults = Options::default();
+        assert_eq!(defaults.format, "text");
+        assert!(!defaults.no_cache);
+
+        let help = help_text();
+        assert!(help.contains("--format"));
+        assert!(help.contains("--json"));
+        assert!(help.contains("--no-cache"));
+
+        let json_flag = parse_args(&["--json".to_string(), "--no-cache".to_string()]);
+        assert_eq!(json_flag.action, "analyze");
+        assert_eq!(json_flag.format, "json");
+        assert!(json_flag.no_cache);
+
+        let format_json_opt = parse_args(&["--format".to_string(), "json".to_string()]);
+        assert_eq!(format_json_opt.action, "analyze");
+        assert_eq!(format_json_opt.format, "json");
+
+        let format_text_opt = parse_args(&["--format".to_string(), "text".to_string()]);
+        assert_eq!(format_text_opt.action, "analyze");
+        assert_eq!(format_text_opt.format, "text");
+
+        let bad_format = parse_args(&["--format".to_string(), "yaml".to_string()]);
+        assert_eq!(bad_format.action, "help");
+        assert_eq!(bad_format.exit_code, 1);
+        assert!(bad_format.message.contains("Unknown format: yaml"));
+        assert!(bad_format.message.contains("Usage: crapper"));
+
+        let missing_format = parse_args(&["--format".to_string()]);
+        assert_eq!(missing_format.action, "help");
+        assert_eq!(missing_format.exit_code, 1);
+    }
+
+    #[test]
+    fn cli_json_output_handles_empty_scored_threshold_and_unknown_format() {
+        let empty_dir = TestDir::new("json-empty");
+        let empty_root = empty_dir.0.to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(
+            &["--root".into(), empty_root.clone(), "--json".into()],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let empty_json: serde_json::Value =
+            serde_json::from_slice(&out).expect("empty --json stdout should parse");
+        assert_eq!(empty_json["version"], 1);
+        assert_eq!(empty_json["tool"], "crapper");
+        assert_eq!(empty_json["summary"]["functions"], 0);
+        assert_eq!(empty_json["entries"], serde_json::json!([]));
+
+        let mut bad_out = Vec::new();
+        let mut bad_err = Vec::new();
+        let bad_code = run_with_io(
+            &[
+                "--root".into(),
+                empty_root,
+                "--format".into(),
+                "yaml".into(),
+            ],
+            &mut bad_out,
+            &mut bad_err,
+        );
+        assert_eq!(bad_code, 1);
+        assert!(bad_out.is_empty());
+        let bad_err_text = String::from_utf8_lossy(&bad_err);
+        assert!(bad_err_text.contains("Unknown format: yaml"));
+        assert!(bad_err_text.contains("Usage: crapper"));
+
+        let scored_dir = TestDir::new("json-scored");
+        create_branchy_fixture(&scored_dir);
+        let (exceeded_code, exceeded_out, exceeded_err) =
+            run_fixture_cli(&scored_dir, &["--format", "json", "--no-metrics"], "5.0");
+        assert_eq!(exceeded_code, 2);
+        let exceeded_val: serde_json::Value =
+            serde_json::from_str(&exceeded_out).expect("valid json on threshold exceeded");
+        assert_eq!(exceeded_val["version"], 1);
+        assert_eq!(exceeded_val["tool"], "crapper");
+        assert_eq!(exceeded_val["languages"], serde_json::json!(["python"]));
+        assert_eq!(exceeded_val["summary"]["functions"], 1);
+        assert_eq!(exceeded_val["summary"]["threshold"], 5.0);
+        assert_eq!(exceeded_val["summary"]["threshold_exceeded"], true);
+        assert_eq!(exceeded_val["entries"][0]["name"], "branchy");
+        assert!(exceeded_err.contains("CRAP threshold exceeded:"));
+        assert!(!metrics_path(&scored_dir.0).exists());
+
+        let (ok_code, ok_out, _) = run_fixture_cli(&scored_dir, &["--json"], "10.0");
+        assert_eq!(ok_code, 0);
+        let ok_val: serde_json::Value =
+            serde_json::from_str(&ok_out).expect("valid json below threshold");
+        assert_eq!(ok_val["summary"]["threshold_exceeded"], false);
+        assert!(metrics_path(&scored_dir.0).is_file());
+    }
+
+    #[test]
+    fn no_cache_flag_and_env_skip_cache_writes_in_subprocesses() {
+        const CACHE_SUBPROC: &str = "CRAPPER_TEST_NO_CACHE_SUBPROC";
+        const CACHE_MODE_ENV: &str = "CRAPPER_TEST_CACHE_MODE";
+
+        if std::env::var_os(CACHE_SUBPROC).is_some() {
+            let mode = std::env::var(CACHE_MODE_ENV).expect("cache mode");
+            let dir = TestDir::new("no-cache-subproc");
+            create_branchy_fixture(&dir);
+            let cache_file = crate::cache::cache_path(&resolve_path(&dir.0));
+
+            let help = parse_args(&["--help".to_string()]);
+            assert_eq!(help.action, "help");
+            assert!(!help.no_cache);
+
+            match mode.as_str() {
+                "flag" => {
+                    assert!(!parse_args(&[]).no_cache);
+                    assert!(parse_args(&["--no-cache".to_string()]).no_cache);
+                    let (code, _, _) =
+                        run_fixture_cli(&dir, &["--no-cache", "--no-metrics"], "10.0");
+                    assert_eq!(code, 0);
+                    assert!(!cache_file.exists());
+                }
+                "env" => {
+                    assert!(parse_args(&[]).no_cache);
+                    let (code, _, _) = run_fixture_cli(&dir, &["--no-metrics"], "10.0");
+                    assert_eq!(code, 0);
+                    assert!(!cache_file.exists());
+                }
+                "enabled" => {
+                    assert!(!parse_args(&[]).no_cache);
+                    let (code, _, _) = run_fixture_cli(&dir, &["--no-metrics"], "10.0");
+                    assert_eq!(code, 0);
+                    assert!(cache_file.is_file());
+                }
+                other => panic!("unexpected mode: {other}"),
+            }
+            return;
+        }
+
+        let dir = TestDir::new("no-cache-host");
+        let exe = std::env::current_exe().expect("current test exe");
+        for (idx, (mode, no_cache_env)) in [("flag", None), ("env", Some("1")), ("enabled", None)]
+            .into_iter()
+            .enumerate()
+        {
+            let cache_dir = dir.0.join(format!("cache-{idx}"));
+            let mut cmd = Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "cli::tests::no_cache_flag_and_env_skip_cache_writes_in_subprocesses",
+                "--nocapture",
+            ]);
+            cmd.env(CACHE_SUBPROC, "1");
+            cmd.env(CACHE_MODE_ENV, mode);
+            cmd.env("UB_TOOLS_CACHE_DIR", &cache_dir);
+            match no_cache_env {
+                Some(v) => {
+                    cmd.env("UB_TOOLS_NO_CACHE", v);
+                }
+                None => {
+                    cmd.env_remove("UB_TOOLS_NO_CACHE");
+                }
+            }
+            let out = cmd.output().expect("spawn no-cache subprocess");
+            assert!(
+                out.status.success(),
+                "subprocess mode {mode} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
             );
         }
     }

@@ -3,6 +3,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use super::model::{Duplicate, Span};
 
 /// Format duplicate candidates as human-readable text.
@@ -71,6 +73,37 @@ pub fn render_edn(candidates: &[Duplicate]) -> String {
     }
     let rows: Vec<String> = candidates.iter().map(candidate_edn).collect();
     format!("{{:candidates [\n{}\n]}}\n", rows.join("\n"))
+}
+
+#[derive(Serialize)]
+struct JsonSummary {
+    entries_scanned: usize,
+    duplicates: usize,
+}
+
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    version: u32,
+    tool: &'static str,
+    threshold: f64,
+    summary: JsonSummary,
+    candidates: &'a [Duplicate],
+}
+
+/// Format duplicate candidates and scan summary as JSON ending with a newline.
+pub fn format_json(candidates: &[Duplicate], entries_scanned: usize, threshold: f64) -> String {
+    let report = JsonReport {
+        version: 1,
+        tool: "dryer",
+        threshold,
+        summary: JsonSummary {
+            entries_scanned,
+            duplicates: candidates.len(),
+        },
+        candidates,
+    };
+    let json = serde_json::to_string_pretty(&report).expect("duplicate report serializes to JSON");
+    format!("{json}\n")
 }
 
 pub fn metrics_path(root: &Path) -> PathBuf {
@@ -179,5 +212,51 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec!["dry.edn".to_string()]);
+    }
+
+    #[test]
+    fn format_json_emits_valid_json_for_empty_and_populated_reports() {
+        let empty = format_json(&[], 0, 0.82);
+        assert!(empty.ends_with('\n'));
+        let empty_val: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty_val["version"], 1);
+        assert_eq!(empty_val["tool"], "dryer");
+        assert_eq!(empty_val["threshold"], 0.82);
+        assert_eq!(empty_val["summary"]["entries_scanned"], 0);
+        assert_eq!(empty_val["summary"]["duplicates"], 0);
+        assert_eq!(empty_val["candidates"].as_array().unwrap().len(), 0);
+
+        let candidate = Duplicate {
+            score: 0.875,
+            language: "rust".into(),
+            left: Span {
+                file: "src/a.rs".into(),
+                start_line: 10,
+                end_line: 20,
+            },
+            right: Span {
+                file: "src/b.rs".into(),
+                start_line: 30,
+                end_line: 40,
+            },
+            left_nodes: 25,
+            right_nodes: 26,
+        };
+        let populated = format_json(&[candidate], 4, 0.75);
+        assert!(populated.ends_with('\n'));
+        let val: serde_json::Value = serde_json::from_str(&populated).unwrap();
+        assert_eq!(val["version"], 1);
+        assert_eq!(val["tool"], "dryer");
+        assert_eq!(val["threshold"], 0.75);
+        assert_eq!(val["summary"]["entries_scanned"], 4);
+        assert_eq!(val["summary"]["duplicates"], 1);
+        assert_eq!(val["candidates"][0]["score"], 0.875);
+        assert_eq!(val["candidates"][0]["language"], "rust");
+        assert_eq!(val["candidates"][0]["left"]["file"], "src/a.rs");
+        assert_eq!(val["candidates"][0]["left"]["start_line"], 10);
+        assert_eq!(val["candidates"][0]["left"]["end_line"], 20);
+        assert_eq!(val["candidates"][0]["right"]["file"], "src/b.rs");
+        assert_eq!(val["candidates"][0]["left_nodes"], 25);
+        assert_eq!(val["candidates"][0]["right_nodes"], 26);
     }
 }

@@ -59,6 +59,28 @@ fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+fn is_mutable_source_with_relative<D: DiscoverProvider>(
+    path: &Path,
+    relative: &Path,
+    skip_dirs: &HashSet<&str>,
+    test_dirs: &HashSet<&str>,
+    discover: &D,
+) -> bool {
+    if normal_parts(relative)
+        .iter()
+        .any(|part| skip_dirs.contains(part.as_str()))
+    {
+        return false;
+    }
+    if is_test_path(relative, test_dirs) || swift_test_relative(relative) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    !discover.is_test_filename(name)
+}
+
 /// True when `path` is a non-test source file inside `root` in a supported language.
 pub fn is_mutable_source<D: DiscoverProvider>(path: &Path, root: &Path, discover: &D) -> bool {
     if discover.language_of(path).is_none() {
@@ -68,23 +90,8 @@ pub fn is_mutable_source<D: DiscoverProvider>(path: &Path, root: &Path, discover
         return false;
     };
     let skip: HashSet<&str> = discover.skip_dirs().iter().copied().collect();
-    if normal_parts(&relative)
-        .iter()
-        .any(|part| skip.contains(part.as_str()))
-    {
-        return false;
-    }
     let test_dirs: HashSet<&str> = discover.test_dirs().iter().copied().collect();
-    if is_test_path(&relative, &test_dirs) {
-        return false;
-    }
-    if swift_test_relative(&relative) {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    !discover.is_test_filename(name)
+    is_mutable_source_with_relative(path, &relative, &skip, &test_dirs, discover)
 }
 
 /// True when `path` is a supported-language file excluded because it is a test file.
@@ -139,18 +146,31 @@ fn walk_dir<D: DiscoverProvider>(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if file_type.is_dir() {
-            if should_enter_dir(
-                current,
-                name_str.as_ref(),
-                project_root,
-                skip_dirs,
-                test_dirs,
-            ) {
-                walk_dir(&path, project_root, skip_dirs, test_dirs, discover, files);
+            if skip_dirs.contains(name_str.as_ref()) {
+                continue;
             }
-        } else if file_type.is_file() || file_type.is_symlink() {
+            if let Ok(relative) = path.strip_prefix(project_root)
+                && is_test_path(relative, test_dirs)
+            {
+                continue;
+            }
+            walk_dir(&path, project_root, skip_dirs, test_dirs, discover, files);
+        } else if file_type.is_file() {
+            if discover.language_of(&path).is_some()
+                && let Ok(relative) = path.strip_prefix(project_root)
+                && is_mutable_source_with_relative(&path, relative, skip_dirs, test_dirs, discover)
+            {
+                files.insert((to_posix(&path), path));
+            }
+        } else if file_type.is_symlink() {
             let resolved = resolve_path(&path);
-            if resolved.is_file() && is_mutable_source(&resolved, project_root, discover) {
+            if resolved.is_file()
+                && discover.language_of(&resolved).is_some()
+                && let Ok(relative) = resolved.strip_prefix(project_root)
+                && is_mutable_source_with_relative(
+                    &resolved, relative, skip_dirs, test_dirs, discover,
+                )
+            {
                 files.insert((to_posix(&resolved), resolved));
             }
         }

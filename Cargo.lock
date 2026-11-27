@@ -158,6 +158,9 @@ name = "dryer"
 version = "0.1.0"
 dependencies = [
  "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-java",

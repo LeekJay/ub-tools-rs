@@ -1,9 +1,11 @@
-//! Text reports for a mutation run and for `--scan`.
+//! Text and JSON reports for a mutation run and for `--scan`.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{FormResult, Site};
+use serde::Serialize;
+
+use crate::model::{FormResult, MutateSite, ScanFileData, ScanSite, Site, SkippedFile};
 
 fn format_score(form: &FormResult) -> String {
     match form.score() {
@@ -169,6 +171,187 @@ pub fn format_scan(
     lines.join("\n")
 }
 
+/// Inputs for formatting a mutation run as structured JSON.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MutateReport<'a> {
+    pub forms: &'a [FormResult],
+    pub sites: &'a [MutateSite],
+    pub written: &'a [String],
+    pub skipped: &'a [SkippedFile],
+    pub baseline_failed: bool,
+}
+
+#[derive(Serialize)]
+struct ScanSummaryJson {
+    files: usize,
+    sites: usize,
+    covered: usize,
+    uncovered: usize,
+    changed_forms: usize,
+}
+
+#[derive(Serialize)]
+struct ScanFileJson<'a> {
+    file: &'a str,
+    changed_forms: Vec<[String; 2]>,
+    sites: Vec<ScanSite>,
+}
+
+#[derive(Serialize)]
+struct ScanJson<'a> {
+    version: u32,
+    tool: &'static str,
+    mode: &'static str,
+    summary: ScanSummaryJson,
+    files: Vec<ScanFileJson<'a>>,
+}
+
+/// Format `--scan` results as a single JSON object terminated with `\n`.
+///
+/// When coverage is ignored or absent for a file, each site's `covered` field
+/// is `null` and `summary.covered` / `summary.uncovered` count only sites whose
+/// coverage was evaluated (`0` when coverage is not evaluated at all).
+pub fn format_scan_json(files: &[ScanFileData]) -> String {
+    let mut total_sites = 0usize;
+    let mut total_covered = 0usize;
+    let mut total_uncovered = 0usize;
+    let mut total_changed_forms = 0usize;
+
+    let json_files: Vec<ScanFileJson<'_>> = files
+        .iter()
+        .map(|entry| {
+            let mut changed_forms: Vec<[String; 2]> = entry
+                .changed
+                .iter()
+                .map(|(ns, form_id)| [ns.clone(), form_id.clone()])
+                .collect();
+            changed_forms.sort();
+            total_changed_forms += changed_forms.len();
+
+            let sites: Vec<ScanSite> = entry
+                .sites
+                .iter()
+                .map(|site| {
+                    let covered = entry
+                        .covered
+                        .as_ref()
+                        .and_then(|map| map.get(&site.mutation_id).copied());
+                    match covered {
+                        Some(true) => total_covered += 1,
+                        Some(false) => total_uncovered += 1,
+                        None => {}
+                    }
+                    ScanSite {
+                        site: site.clone(),
+                        covered,
+                    }
+                })
+                .collect();
+            total_sites += sites.len();
+
+            ScanFileJson {
+                file: &entry.file,
+                changed_forms,
+                sites,
+            }
+        })
+        .collect();
+
+    let payload = ScanJson {
+        version: 1,
+        tool: "mutator",
+        mode: "scan",
+        summary: ScanSummaryJson {
+            files: files.len(),
+            sites: total_sites,
+            covered: total_covered,
+            uncovered: total_uncovered,
+            changed_forms: total_changed_forms,
+        },
+        files: json_files,
+    };
+    let mut out = serde_json::to_string(&payload).expect("scan JSON serialization");
+    out.push('\n');
+    out
+}
+
+#[derive(Serialize)]
+struct MutateSummaryJson {
+    killed: usize,
+    survived: usize,
+    uncovered: usize,
+    sites: usize,
+    score: Option<f64>,
+    baseline_failed: bool,
+}
+
+#[derive(Serialize)]
+struct MutateFormJson<'a> {
+    #[serde(flatten)]
+    form: &'a FormResult,
+    score: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct MutateJson<'a> {
+    version: u32,
+    tool: &'static str,
+    mode: &'static str,
+    summary: MutateSummaryJson,
+    forms: Vec<MutateFormJson<'a>>,
+    sites: &'a [MutateSite],
+    written: &'a [String],
+    skipped: &'a [SkippedFile],
+}
+
+/// Format mutation run results as a single JSON object terminated with `\n`.
+pub fn format_mutate_json(report: &MutateReport<'_>) -> String {
+    let killed: usize = report.forms.iter().map(|f| f.killed).sum();
+    let survived: usize = report.forms.iter().map(|f| f.survived).sum();
+    let uncovered: usize = report.forms.iter().map(|f| f.uncovered).sum();
+    let total_sites: usize = if report.forms.is_empty() {
+        report.sites.len()
+    } else {
+        report.forms.iter().map(|f| f.sites).sum()
+    };
+    let executed = killed + survived;
+    let score = if executed == 0 {
+        None
+    } else {
+        Some(killed as f64 / executed as f64)
+    };
+
+    let forms: Vec<MutateFormJson<'_>> = report
+        .forms
+        .iter()
+        .map(|form| MutateFormJson {
+            form,
+            score: form.score(),
+        })
+        .collect();
+
+    let payload = MutateJson {
+        version: 1,
+        tool: "mutator",
+        mode: "mutate",
+        summary: MutateSummaryJson {
+            killed,
+            survived,
+            uncovered,
+            sites: total_sites,
+            score,
+            baseline_failed: report.baseline_failed,
+        },
+        forms,
+        sites: report.sites,
+        written: report.written,
+        skipped: report.skipped,
+    };
+    let mut out = serde_json::to_string(&payload).expect("mutate JSON serialization");
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +442,148 @@ mod tests {
                 Some(&covered_false)
             )
             .contains("uncovered")
+        );
+    }
+
+    #[test]
+    fn format_scan_json_covers_evaluated_and_ignored_coverage_and_empty() {
+        let empty = format_scan_json(&[]);
+        assert!(empty.ends_with('\n'));
+        let empty_val: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty_val["version"], 1);
+        assert_eq!(empty_val["tool"], "mutator");
+        assert_eq!(empty_val["mode"], "scan");
+        assert_eq!(
+            empty_val["summary"],
+            serde_json::json!({
+                "files": 0,
+                "sites": 0,
+                "covered": 0,
+                "uncovered": 0,
+                "changed_forms": 0
+            })
+        );
+        assert_eq!(empty_val["files"], serde_json::json!([]));
+
+        let s1 = site();
+        let mut s2 = site();
+        s2.line = 3;
+        s2.mutation_id = "m2".to_string();
+
+        let with_cov = ScanFileData {
+            file: "src/demo.py".to_string(),
+            sites: vec![s1.clone(), s2],
+            changed: HashSet::from([
+                ("demo".to_string(), "defn/z".to_string()),
+                ("demo".to_string(), "defn/a".to_string()),
+            ]),
+            covered: Some(HashMap::from([
+                ("m".to_string(), true),
+                ("m2".to_string(), false),
+            ])),
+            discovered_sites: None,
+        };
+        let without_cov = ScanFileData {
+            file: "src/other.py".to_string(),
+            sites: vec![s1],
+            changed: HashSet::new(),
+            covered: None,
+            discovered_sites: None,
+        };
+
+        let out = format_scan_json(&[with_cov, without_cov]);
+        assert!(out.ends_with('\n'));
+        let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["summary"]["files"], 2);
+        assert_eq!(val["summary"]["sites"], 3);
+        assert_eq!(val["summary"]["covered"], 1);
+        assert_eq!(val["summary"]["uncovered"], 1);
+        assert_eq!(val["summary"]["changed_forms"], 2);
+
+        assert_eq!(
+            val["files"][0]["changed_forms"],
+            serde_json::json!([["demo", "defn/a"], ["demo", "defn/z"]])
+        );
+        assert_eq!(val["files"][0]["sites"][0]["file"], "src/demo.py");
+        assert_eq!(val["files"][0]["sites"][0]["original"], ">");
+        assert_eq!(val["files"][0]["sites"][0]["anchor_line"], 0);
+        assert_eq!(val["files"][0]["sites"][0]["covered"], true);
+        assert_eq!(val["files"][0]["sites"][1]["covered"], false);
+        assert_eq!(
+            val["files"][1]["sites"][0]["covered"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn format_mutate_json_handles_outcomes_empty_and_baseline_failure() {
+        let empty = format_mutate_json(&MutateReport::default());
+        assert!(empty.ends_with('\n'));
+        let empty_val: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty_val["version"], 1);
+        assert_eq!(empty_val["tool"], "mutator");
+        assert_eq!(empty_val["mode"], "mutate");
+        assert_eq!(
+            empty_val["summary"],
+            serde_json::json!({
+                "killed": 0,
+                "survived": 0,
+                "uncovered": 0,
+                "sites": 0,
+                "score": null,
+                "baseline_failed": false
+            })
+        );
+        assert_eq!(empty_val["forms"], serde_json::json!([]));
+        assert_eq!(empty_val["sites"], serde_json::json!([]));
+        assert_eq!(empty_val["written"], serde_json::json!([]));
+        assert_eq!(empty_val["skipped"], serde_json::json!([]));
+
+        let forms = [form(1, 1, 1, 3)];
+        let sites = [
+            MutateSite {
+                site: site(),
+                status: Some("killed".to_string()),
+            },
+            MutateSite {
+                site: site(),
+                status: Some("survived".to_string()),
+            },
+            MutateSite {
+                site: site(),
+                status: Some("uncovered".to_string()),
+            },
+        ];
+        let written = [".metrics/mutate/demo.edn".to_string()];
+        let skipped = [SkippedFile {
+            file: "bin.dat".to_string(),
+            reason: "file is not UTF-8".to_string(),
+        }];
+        let out = format_mutate_json(&MutateReport {
+            forms: &forms,
+            sites: &sites,
+            written: &written,
+            skipped: &skipped,
+            baseline_failed: true,
+        });
+        assert!(out.ends_with('\n'));
+        let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["summary"]["killed"], 1);
+        assert_eq!(val["summary"]["survived"], 1);
+        assert_eq!(val["summary"]["uncovered"], 1);
+        assert_eq!(val["summary"]["sites"], 3);
+        assert_eq!(val["summary"]["score"], 0.5);
+        assert_eq!(val["summary"]["baseline_failed"], true);
+        assert_eq!(val["forms"][0]["score"], 0.5);
+        assert_eq!(val["sites"][0]["status"], "killed");
+        assert_eq!(val["sites"][1]["status"], "survived");
+        assert_eq!(
+            val["written"],
+            serde_json::json!([".metrics/mutate/demo.edn"])
+        );
+        assert_eq!(
+            val["skipped"],
+            serde_json::json!([{"file": "bin.dat", "reason": "file is not UTF-8"}])
         );
     }
 }

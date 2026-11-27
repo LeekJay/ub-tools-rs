@@ -1,6 +1,56 @@
 use std::collections::BTreeSet;
 
+use serde::Serialize;
+
 use crate::model::Entry;
+
+#[derive(Serialize)]
+struct JsonSummary {
+    functions: usize,
+    worst_crap: Option<f64>,
+    max_complexity: Option<usize>,
+    threshold: Option<f64>,
+    threshold_exceeded: bool,
+}
+
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    version: u32,
+    tool: &'static str,
+    languages: Vec<&'a str>,
+    summary: JsonSummary,
+    entries: &'a [Entry],
+}
+
+pub fn format_json(entries: &[Entry], threshold: Option<f64>) -> String {
+    let languages: Vec<&str> = entries
+        .iter()
+        .map(|e| e.language.as_str())
+        .filter(|lang| !lang.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let worst_crap = entries.iter().filter_map(|e| e.crap).max_by(f64::total_cmp);
+    let max_complexity = entries.iter().map(|e| e.complexity).max();
+    let threshold_exceeded = worst_crap.is_some_and(|w| threshold.is_some_and(|t| w > t));
+
+    let payload = JsonReport {
+        version: 1,
+        tool: "crapper",
+        languages,
+        summary: JsonSummary {
+            functions: entries.len(),
+            worst_crap,
+            max_complexity,
+            threshold,
+            threshold_exceeded,
+        },
+        entries,
+    };
+    let mut json = serde_json::to_string_pretty(&payload).expect("serialize CRAP JSON report");
+    json.push('\n');
+    json
+}
 
 fn format_coverage(coverage: Option<f64>) -> String {
     match coverage {
@@ -85,5 +135,72 @@ mod tests {
         // Verify line alignment uses char count (35 chars for namespace), matching Python.
         let row = text.lines().find(|l| l.starts_with("greet")).unwrap();
         assert_eq!(row.chars().count(), 30 + 1 + 35 + 1 + 4 + 1 + 6 + 1 + 8);
+    }
+
+    #[test]
+    fn json_report_handles_empty_and_scored_entries() {
+        let empty = format_json(&[], None);
+        assert!(empty.ends_with('\n'));
+        let empty_val: serde_json::Value = serde_json::from_str(&empty).expect("valid empty json");
+        assert_eq!(empty_val["version"], 1);
+        assert_eq!(empty_val["tool"], "crapper");
+        assert_eq!(empty_val["languages"], serde_json::json!([]));
+        assert_eq!(empty_val["summary"]["functions"], 0);
+        assert_eq!(empty_val["summary"]["worst_crap"], serde_json::Value::Null);
+        assert_eq!(
+            empty_val["summary"]["max_complexity"],
+            serde_json::Value::Null
+        );
+        assert_eq!(empty_val["summary"]["threshold"], serde_json::Value::Null);
+        assert_eq!(empty_val["summary"]["threshold_exceeded"], false);
+        assert_eq!(empty_val["entries"], serde_json::json!([]));
+
+        let entries = vec![
+            Entry {
+                name: "zeta".to_string(),
+                namespace: "pkg.z".to_string(),
+                complexity: 5,
+                coverage: Some(0.0),
+                crap: Some(30.0),
+                path: "src/z.rs".to_string(),
+                language: "rust".to_string(),
+            },
+            Entry {
+                name: "alpha".to_string(),
+                namespace: "pkg.a".to_string(),
+                complexity: 8,
+                coverage: None,
+                crap: None,
+                path: "src/a.py".to_string(),
+                language: "python".to_string(),
+            },
+            Entry {
+                name: "blank".to_string(),
+                namespace: "pkg.b".to_string(),
+                complexity: 1,
+                coverage: Some(100.0),
+                crap: Some(1.0),
+                path: "src/b.py".to_string(),
+                language: String::new(),
+            },
+        ];
+
+        let below = format_json(&entries, Some(30.0));
+        assert!(below.ends_with('\n'));
+        let below_val: serde_json::Value = serde_json::from_str(&below).expect("valid below json");
+        assert_eq!(
+            below_val["languages"],
+            serde_json::json!(["python", "rust"])
+        );
+        assert_eq!(below_val["summary"]["functions"], 3);
+        assert_eq!(below_val["summary"]["worst_crap"], 30.0);
+        assert_eq!(below_val["summary"]["max_complexity"], 8);
+        assert_eq!(below_val["summary"]["threshold"], 30.0);
+        assert_eq!(below_val["summary"]["threshold_exceeded"], false);
+        assert_eq!(below_val["entries"][0]["name"], "zeta");
+
+        let above = format_json(&entries, Some(29.9));
+        let above_val: serde_json::Value = serde_json::from_str(&above).expect("valid above json");
+        assert_eq!(above_val["summary"]["threshold_exceeded"], true);
     }
 }

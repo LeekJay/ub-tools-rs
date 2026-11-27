@@ -8,12 +8,28 @@ use chrono::SecondsFormat;
 use crate::edn::{EdnValue, dumps, keyword, loads};
 use crate::functions::{mutation_file, mutation_namespace};
 use crate::model::{FormResult, History, PriorForm};
-use crate::path_util::{relative_posix, resolve_path};
+use crate::path_util::{relative_posix, resolve_path, to_posix};
 
 /// Relative POSIX path of `path` under `root`.
 pub fn source_key(path: &Path, root: &Path) -> Result<String, String> {
     relative_posix(path, root)
         .ok_or_else(|| format!("{} is not under {}", path.display(), root.display()))
+}
+
+pub(crate) fn source_key_resolved(
+    resolved_path: &Path,
+    resolved_root: &Path,
+) -> Result<String, String> {
+    resolved_path
+        .strip_prefix(resolved_root)
+        .map(to_posix)
+        .map_err(|_| {
+            format!(
+                "{} is not under {}",
+                resolved_path.display(),
+                resolved_root.display()
+            )
+        })
 }
 
 /// Snapshot `.edn` file path for `namespace` under `root/.metrics/mutate`.

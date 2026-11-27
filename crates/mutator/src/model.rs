@@ -101,6 +101,40 @@ pub struct RunResult {
     pub skipped: String,
 }
 
+/// Structured output from scanning one source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanFileData {
+    pub file: String,
+    pub sites: Vec<Site>,
+    pub changed: std::collections::HashSet<(String, String)>,
+    pub covered: Option<HashMap<String, bool>>,
+    /// Unfiltered discovered sites populated only on cache miss so callers can update `SiteCache`.
+    pub discovered_sites: Option<Vec<Site>>,
+}
+
+/// One mutation site annotated with its optional coverage state for `--scan --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanSite {
+    #[serde(flatten)]
+    pub site: Site,
+    pub covered: Option<bool>,
+}
+
+/// One mutation site annotated with its run outcome status (`"killed"`, `"survived"`, `"uncovered"`, or `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutateSite {
+    #[serde(flatten)]
+    pub site: Site,
+    pub status: Option<String>,
+}
+
+/// A source file excluded from mutation along with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub file: String,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -147,23 +147,26 @@ fn is_skipped_dir_name(name: &str) -> bool {
 }
 
 fn walk_root(root: &Path) -> Vec<PathBuf> {
-    if !root.exists() {
+    let resolved_root = resolve_path(root);
+    if !resolved_root.exists() {
         return Vec::new();
     }
-    if root.is_file() {
-        return vec![root.to_path_buf()];
+    if resolved_root.is_file() {
+        return vec![resolved_root];
     }
     let mut found = Vec::new();
-    let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
-        if entry.depth() == 0 {
-            return true;
-        }
-        if entry.file_type().is_dir() {
-            let name = entry.file_name().to_str().unwrap_or("");
-            return !is_skipped_dir_name(name);
-        }
-        true
-    });
+    let walker = WalkDir::new(&resolved_root)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_dir() {
+                let name = entry.file_name().to_str().unwrap_or("");
+                return !is_skipped_dir_name(name);
+            }
+            true
+        });
     for entry in walker.flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -180,8 +183,7 @@ fn walk_root(root: &Path) -> Vec<PathBuf> {
 pub fn iter_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut seen: BTreeSet<(String, PathBuf)> = BTreeSet::new();
     for root in roots {
-        for path in walk_root(root) {
-            let resolved = resolve_path(&path);
+        for resolved in walk_root(root) {
             let key = to_posix(&resolved);
             seen.insert((key, resolved));
         }

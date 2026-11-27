@@ -2,21 +2,27 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::io::{BufWriter, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use regex::Regex;
+use ub_runtime::{FileStamp, ManifestStampCache};
 
+use crate::cache::{CachedSites, SiteCache, file_stamp, repo_cache_path};
 use crate::engine::{
-    BaselineCache, EngineProvider, MutateOptions, mutate_file_with_history, restore_backups,
-    scan_file_with_history,
+    BaselineCache, EngineProvider, MutateOptions, ScanOptions, mutate_file_cached_with_history,
+    restore_backups, scan_file_cached_with_history, scan_file_resolved_with_history,
 };
-use crate::metrics::{HistoryIndex, source_key};
-use crate::model::{FormResult, History, RunResult};
+use crate::metrics::{HistoryIndex, source_key_resolved};
+use crate::model::{FormResult, History, MutateSite, RunResult, ScanFileData, Site, SkippedFile};
 use crate::path_util::{resolve_path, to_posix};
-use crate::report::{format_results, format_site_log};
+use crate::report::{
+    MutateReport, format_mutate_json, format_results, format_scan, format_scan_json,
+    format_site_log,
+};
 use crate::runner::CommandRunner;
 use crate::sources::{DiscoverProvider, is_mutable_source, is_skipped_test, iter_source_files};
 
@@ -88,6 +94,8 @@ Options:
                                 smaller of this limit, the cores, and the
                                 number of selected sites.
   --verbose                     Print each test command and each mutant.
+  --json                        Emit machine-readable JSON output.
+  --no-cache                    Bypass and do not update the site cache.
 
 Arguments:
   path              File or directory to mutate. Test paths are skipped.
@@ -182,6 +190,8 @@ pub struct Options {
     pub max_workers: Option<usize>,
     pub changed: bool,
     pub verbose: bool,
+    pub json: bool,
+    pub no_cache: bool,
 }
 
 impl Default for Options {
@@ -208,6 +218,8 @@ impl Default for Options {
             max_workers: None,
             changed: false,
             verbose: false,
+            json: false,
+            no_cache: false,
         }
     }
 }
@@ -462,6 +474,14 @@ pub fn parse_args_with_help(args: &[String], help: &str) -> Options {
                     options.verbose = true;
                     index += 1;
                 }
+                "--json" => {
+                    options.json = true;
+                    index += 1;
+                }
+                "--no-cache" => {
+                    options.no_cache = true;
+                    index += 1;
+                }
                 _ if arg.starts_with('-') => {
                     return Err(format!("Unknown option: {arg}"));
                 }
@@ -495,6 +515,7 @@ pub fn parse_args_with_help(args: &[String], help: &str) -> Options {
     if options.scan && options.max_workers.is_some() {
         return help_error("--scan cannot be combined with --max-workers", help);
     }
+    options.no_cache = options.no_cache || ub_runtime::env_no_cache();
     options
 }
 
@@ -651,8 +672,12 @@ fn matching_filters(files: Vec<PathBuf>, filters: &[String]) -> Vec<PathBuf> {
 }
 
 fn inside_root(files: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
-    let mut inside = Vec::new();
+    let mut inside = Vec::with_capacity(files.len());
     for path in files {
+        if path.strip_prefix(root).is_ok() {
+            inside.push(path);
+            continue;
+        }
         let resolved = resolve_path(&path);
         if resolved.strip_prefix(root).is_err() {
             eprintln!(
@@ -763,17 +788,102 @@ fn restore(root: &Path) {
     }
 }
 
-fn history_for<'a>(
-    index: &'a HistoryIndex,
-    empty: &'a History,
-    path: &Path,
-    root: &Path,
-) -> &'a History {
-    let resolved = resolve_path(path);
-    source_key(&resolved, root)
-        .ok()
-        .and_then(|key| index.get(&key))
-        .unwrap_or(empty)
+fn write_stdout_bytes(bytes: &[u8]) {
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+struct CacheSession {
+    path: Option<PathBuf>,
+    cache: SiteCache,
+}
+
+impl CacheSession {
+    fn open(no_cache: bool, root: &Path) -> Self {
+        if no_cache {
+            return Self {
+                path: None,
+                cache: SiteCache::default(),
+            };
+        }
+        let path = repo_cache_path(root);
+        let cache = SiteCache::load_from(&path);
+        Self {
+            path: Some(path),
+            cache,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn save_misses(&mut self, misses: Vec<(String, CachedSites)>, active_keys: &HashSet<String>) {
+        if misses.is_empty() {
+            return;
+        }
+        if let Some(path) = self.path.as_deref() {
+            self.cache.merge_and_save_to(path, misses, active_keys);
+        }
+    }
+}
+
+struct FileCacheLookup<'a> {
+    canonical_key: String,
+    file_key: Option<String>,
+    language: &'static str,
+    stamp: Option<FileStamp>,
+    cached_sites: Option<&'a [Site]>,
+}
+
+fn lookup_file_cache_resolved<'a, P: CliProvider>(
+    session: &'a CacheSession,
+    manifests: &mut ManifestStampCache,
+    resolved: &Path,
+    resolved_root: &Path,
+    provider: &P,
+) -> FileCacheLookup<'a> {
+    let canonical_key = to_posix(resolved);
+    let language = DiscoverProvider::language_of(provider, resolved).unwrap_or("");
+    let file_key = source_key_resolved(resolved, resolved_root).ok();
+    if !session.enabled() {
+        return FileCacheLookup {
+            canonical_key,
+            file_key,
+            language,
+            stamp: None,
+            cached_sites: None,
+        };
+    }
+    let stamp = file_stamp(resolved, language, manifests);
+    let cached_sites = match (&file_key, stamp) {
+        (Some(fk), Some(st)) => session.cache.get(&canonical_key, st, fk, language),
+        _ => None,
+    };
+    FileCacheLookup {
+        canonical_key,
+        file_key,
+        language,
+        stamp,
+        cached_sites,
+    }
+}
+
+fn print_scan_text(scanned: &[ScanFileData]) {
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
+    for item in scanned {
+        let text = format_scan(
+            &item.file,
+            &item.sites,
+            &item.changed,
+            item.covered.as_ref(),
+        );
+        let _ = out.write_all(text.as_bytes());
+    }
+    let _ = out.flush();
 }
 
 fn scan<P: CliProvider + Sync>(
@@ -782,54 +892,113 @@ fn scan<P: CliProvider + Sync>(
     files: &[PathBuf],
     provider: &P,
 ) -> i32 {
+    let mut session = CacheSession::open(options.no_cache, root);
     let history_index = HistoryIndex::load(root);
     let empty_history = History::default();
-    let results: Vec<Result<String, String>> = files
+    let results: Vec<(FileCacheLookup<'_>, Result<ScanFileData, String>)> = files
         .par_iter()
-        .map(|path| {
+        .map_init(ManifestStampCache::new, |manifests, path| {
+            let lookup = lookup_file_cache_resolved(&session, manifests, path, root, provider);
             let cov = coverage_for(options, root, path, provider);
-            let history = history_for(&history_index, &empty_history, path, root);
-            scan_file_with_history(
-                path,
-                root,
-                cov.as_ref(),
-                options.no_coverage,
-                options.lines.as_ref(),
-                history,
-                provider,
-            )
+            let history = lookup
+                .file_key
+                .as_deref()
+                .and_then(|key| history_index.get(key))
+                .unwrap_or(&empty_history);
+            let scan_opts = ScanOptions {
+                covered_lines: cov.as_ref(),
+                ignore_coverage: options.no_coverage,
+                lines: options.lines.as_ref(),
+                cached_sites: lookup.cached_sites,
+            };
+            let outcome = match lookup.file_key.as_deref() {
+                Some(file_key) => scan_file_resolved_with_history(
+                    path, root, file_key, &scan_opts, history, provider,
+                ),
+                None => scan_file_cached_with_history(path, root, &scan_opts, history, provider),
+            };
+            (lookup, outcome)
         })
         .collect();
-    for item in results {
-        match item {
-            Ok(out) => print!("{out}"),
+
+    let mut scanned = Vec::with_capacity(results.len());
+    let mut misses = Vec::new();
+    let mut active_keys = HashSet::with_capacity(files.len());
+    for (lookup, outcome) in results {
+        active_keys.insert(lookup.canonical_key.clone());
+        match outcome {
+            Ok(mut data) => {
+                if session.enabled()
+                    && let Some(sites) = data.discovered_sites.take()
+                    && let (Some(st), Some(fk)) = (lookup.stamp, lookup.file_key)
+                {
+                    misses.push((
+                        lookup.canonical_key,
+                        CachedSites {
+                            stamp: st,
+                            file_key: fk,
+                            language: lookup.language.to_string(),
+                            sites,
+                        },
+                    ));
+                }
+                scanned.push(data);
+            }
             Err(err) => {
+                if !options.json {
+                    print_scan_text(&scanned);
+                }
                 eprintln!("{err}");
                 return 2;
             }
         }
     }
+    session.save_misses(misses, &active_keys);
+    if options.json {
+        write_stdout_bytes(format_scan_json(&scanned).as_bytes());
+    } else {
+        print_scan_text(&scanned);
+    }
     0
 }
 
-fn record_result(
-    result: RunResult,
-    forms: &mut Vec<FormResult>,
-    written: &mut Vec<String>,
-) -> &'static str {
+#[derive(Default)]
+struct MutateAccumulator {
+    forms: Vec<FormResult>,
+    sites: Vec<MutateSite>,
+    written: Vec<String>,
+    skipped: Vec<SkippedFile>,
+    baseline_failed: bool,
+    survived: bool,
+}
+
+fn record_result(result: RunResult, json: bool, acc: &mut MutateAccumulator) {
     if !result.skipped.is_empty() {
         eprintln!("Skipping {}: {}", result.path, result.skipped);
-        return "skip";
+        acc.skipped.push(SkippedFile {
+            file: result.path,
+            reason: result.skipped,
+        });
+        return;
     }
     if result.baseline_failed {
         eprintln!("{}", result.baseline_message);
-        return "baseline";
+        acc.baseline_failed = true;
+        return;
     }
-    print!("{}", format_site_log(&result.sites, &result.statuses));
-    let any_survived = result.forms.iter().any(|f| f.survived > 0);
-    forms.extend(result.forms);
-    written.extend(result.written);
-    if any_survived { "survived" } else { "ok" }
+    if json {
+        for site in result.sites {
+            let status = result.statuses.get(&site.mutation_id).cloned();
+            acc.sites.push(MutateSite { site, status });
+        }
+    } else {
+        print!("{}", format_site_log(&result.sites, &result.statuses));
+    }
+    if result.forms.iter().any(|f| f.survived > 0) {
+        acc.survived = true;
+    }
+    acc.forms.extend(result.forms);
+    acc.written.extend(result.written);
 }
 
 fn finish(baseline_failed: bool, survived: bool) -> i32 {
@@ -848,17 +1017,18 @@ fn mutate_files<P: CliProvider + Sync>(
     files: &[PathBuf],
     provider: &P,
 ) -> i32 {
+    let mut session = CacheSession::open(options.no_cache, root);
+    let mut manifests = ManifestStampCache::new();
     let runner = CommandRunner::new(options.verbose);
     let mut baselines = BaselineCache::new();
     let history_index = HistoryIndex::load(root);
     let empty_history = History::default();
-    let mut forms = Vec::new();
-    let mut written = Vec::new();
-    let mut baseline_failed = false;
-    let mut survived = false;
+    let mut acc = MutateAccumulator::default();
+    let mut misses = Vec::new();
+    let mut active_keys = HashSet::with_capacity(files.len());
+
     for path in files {
         let cov = coverage_for(options, root, path, provider);
-        let history = history_for(&history_index, &empty_history, path, root);
         let opts = MutateOptions {
             covered_lines: cov.as_ref(),
             ignore_coverage: options.no_coverage,
@@ -871,28 +1041,70 @@ fn mutate_files<P: CliProvider + Sync>(
             xcode_scheme: options.xcode_scheme.as_deref(),
             xcode_destination: options.xcode_destination.as_deref(),
         };
-        let result = mutate_file_with_history(
-            path,
-            root,
-            &runner,
-            &opts,
-            &mut baselines,
-            history,
-            provider,
-        );
-        match record_result(result, &mut forms, &mut written) {
-            "baseline" => baseline_failed = true,
-            "survived" => survived = true,
-            _ => {}
+        let (canonical_key, file_key, language, stamp, was_hit, result) = {
+            let lookup = lookup_file_cache_resolved(&session, &mut manifests, path, root, provider);
+            let history = lookup
+                .file_key
+                .as_deref()
+                .and_then(|key| history_index.get(key))
+                .unwrap_or(&empty_history);
+            let result = mutate_file_cached_with_history(
+                path,
+                root,
+                &runner,
+                &opts,
+                &mut baselines,
+                history,
+                lookup.cached_sites,
+                provider,
+            );
+            (
+                lookup.canonical_key,
+                lookup.file_key,
+                lookup.language,
+                lookup.stamp,
+                lookup.cached_sites.is_some(),
+                result,
+            )
+        };
+        active_keys.insert(canonical_key.clone());
+        if session.enabled()
+            && !was_hit
+            && result.skipped.is_empty()
+            && !result.baseline_failed
+            && let (Some(st), Some(fk)) = (stamp, file_key)
+        {
+            misses.push((
+                canonical_key,
+                CachedSites {
+                    stamp: st,
+                    file_key: fk,
+                    language: language.to_string(),
+                    sites: result.sites.clone(),
+                },
+            ));
         }
+        record_result(result, options.json, &mut acc);
     }
-    if !forms.is_empty() {
-        print!("{}", format_results(&forms));
+
+    session.save_misses(misses, &active_keys);
+
+    if options.json {
+        let report = MutateReport {
+            forms: &acc.forms,
+            sites: &acc.sites,
+            written: &acc.written,
+            skipped: &acc.skipped,
+            baseline_failed: acc.baseline_failed,
+        };
+        write_stdout_bytes(format_mutate_json(&report).as_bytes());
+    } else if !acc.forms.is_empty() {
+        write_stdout_bytes(format_results(&acc.forms).as_bytes());
     }
-    for path in written {
+    for path in acc.written {
         eprintln!("Wrote {path}");
     }
-    finish(baseline_failed, survived)
+    finish(acc.baseline_failed, acc.survived)
 }
 
 /// Execute the full CLI pipeline with the supplied provider.
@@ -911,7 +1123,15 @@ pub fn run_with<P: CliProvider + Sync>(args: &[String], provider: &P) -> i32 {
         }
     };
     if files.is_empty() {
-        println!("No source files to mutate.");
+        if options.json {
+            if options.scan {
+                print!("{}", format_scan_json(&[]));
+            } else {
+                print!("{}", format_mutate_json(&MutateReport::default()));
+            }
+        } else {
+            println!("No source files to mutate.");
+        }
         return 0;
     }
     if options.scan {
@@ -937,6 +1157,8 @@ pub fn run_with<P: CliProvider + Sync>(args: &[String], provider: &P) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn s(items: &[&str]) -> Vec<String> {
@@ -950,6 +1172,13 @@ mod tests {
         assert!(help.contains("uml-viewer"));
         assert!(help.contains("__pycache__"));
         assert!(help.contains("testdata"));
+        assert!(help.contains("--json"));
+        assert!(help.contains("--no-cache"));
+
+        let json_no_cache = parse_args_with_help(&s(&["--scan", "--json", "--no-cache"]), &help);
+        assert!(json_no_cache.json);
+        assert!(json_no_cache.no_cache);
+        assert!(json_no_cache.scan);
 
         let lines = parse_args_with_help(&s(&["--lines", "2, 4", "src/demo.py"]), &help);
         assert_eq!(lines.lines, Some(HashSet::from([2, 4])));
@@ -1168,5 +1397,226 @@ mod tests {
         assert_eq!(calls, 1);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn env_no_cache_respected_except_on_help_in_isolated_subprocess() {
+        const MARKER: &str = "MUTATOR_CLI_NO_CACHE_SUBPROC";
+        if std::env::var_os(MARKER).is_some() {
+            let help = help_text(FALLBACK_SKIP_DIRS, FALLBACK_TEST_DIRS);
+            let parsed_run = parse_args_with_help(&s(&["--scan"]), &help);
+            assert_eq!(parsed_run.action, "mutate");
+            assert!(parsed_run.no_cache);
+
+            let parsed_help = parse_args_with_help(&s(&["--help"]), &help);
+            assert_eq!(parsed_help.action, "help");
+            assert!(!parsed_help.no_cache);
+
+            let parsed_err = parse_args_with_help(&s(&["--not-a-flag"]), &help);
+            assert_eq!(parsed_err.action, "help");
+            assert!(!parsed_err.no_cache);
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current test exe");
+        let output = ProcessCommand::new(exe)
+            .args([
+                "--exact",
+                "cli::tests::env_no_cache_respected_except_on_help_in_isolated_subprocess",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .env("UB_TOOLS_NO_CACHE", "1")
+            .output()
+            .expect("spawn subprocess");
+        assert!(
+            output.status.success(),
+            "subprocess failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn scan_uses_cache_avoids_rewrite_on_hit_and_respects_no_cache() {
+        struct CountingSpy {
+            sites_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl DiscoverProvider for CountingSpy {
+            fn language_of(&self, _path: &Path) -> Option<&'static str> {
+                Some("python")
+            }
+            fn is_test_filename(&self, _file_name: &str) -> bool {
+                false
+            }
+            fn skip_dirs(&self) -> &[&str] {
+                FALLBACK_SKIP_DIRS
+            }
+            fn test_dirs(&self) -> &[&str] {
+                FALLBACK_TEST_DIRS
+            }
+        }
+        impl EngineProvider for CountingSpy {
+            fn sites_in_file(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+                file_key: &str,
+            ) -> Vec<Site> {
+                self.sites_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                vec![Site {
+                    file: file_key.to_string(),
+                    namespace: "demo".to_string(),
+                    form_id: "defn/f".to_string(),
+                    name: "f".to_string(),
+                    line: 2,
+                    start: 10,
+                    end: 11,
+                    original: ">".to_string(),
+                    mutant: ">=".to_string(),
+                    category: "comparison".to_string(),
+                    mutation_id: "m".to_string(),
+                    anchor_line: 2,
+                }]
+            }
+            fn form_digests(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+            ) -> HashMap<(String, String), String> {
+                HashMap::new()
+            }
+            fn form_spans(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+            ) -> crate::engine::FormSpanMap {
+                HashMap::new()
+            }
+            fn test_plan(
+                &self,
+                root: &Path,
+                _source: &Path,
+                _language: &str,
+                _override_cmd: Option<&str>,
+                _xcode_scheme: Option<&str>,
+                _xcode_destination: Option<&str>,
+            ) -> (crate::runner::Command, PathBuf) {
+                (
+                    crate::runner::Command::Argv(vec!["true".into()]),
+                    root.to_path_buf(),
+                )
+            }
+        }
+        impl CliProvider for CountingSpy {
+            fn run_coverage(&self, _root: &Path, _files: &[PathBuf]) -> i32 {
+                0
+            }
+            fn covered_lines(
+                &self,
+                _root: &Path,
+                _path: &Path,
+                _language: &str,
+            ) -> Option<HashSet<usize>> {
+                None
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("mutator_cli_cache_{}", uuid::Uuid::new_v4()));
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let cache_path = repo_cache_path(&root);
+        let _cleanup = Cleanup(root.clone(), cache_path.clone());
+
+        let file = root.join("src").join("demo.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "def f(x):\n    return x > 0\n").unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        let spy = CountingSpy {
+            sites_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        // 1. Cold scan misses cache, calls sites_in_file once, writes cache once.
+        let code = run_with(
+            &s(&[
+                "--scan",
+                "--no-coverage",
+                "--root",
+                &root_str,
+                "src/demo.py",
+            ]),
+            &spy,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            spy.sites_calls.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(cache_path.is_file());
+        let first_bytes = std::fs::read(&cache_path).unwrap();
+
+        // 2. Warm scan hits cache: sites_in_file count unchanged, cache file untouched.
+        let sentinel_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&cache_path)
+            .unwrap()
+            .set_modified(sentinel_time)
+            .unwrap();
+        let stamp_before = ub_runtime::file_mtime_size(&cache_path).unwrap();
+        assert_eq!(
+            run_with(
+                &s(&[
+                    "--scan",
+                    "--no-coverage",
+                    "--root",
+                    &root_str,
+                    "src/demo.py"
+                ]),
+                &spy,
+            ),
+            0
+        );
+        assert_eq!(
+            spy.sites_calls.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            ub_runtime::file_mtime_size(&cache_path).unwrap(),
+            stamp_before
+        );
+        assert_eq!(std::fs::read(&cache_path).unwrap().len(), first_bytes.len());
+
+        // 3. --no-cache bypasses existing cache and forces re-discovery without rewriting cache.
+        assert_eq!(
+            run_with(
+                &s(&[
+                    "--scan",
+                    "--no-coverage",
+                    "--no-cache",
+                    "--root",
+                    &root_str,
+                    "src/demo.py"
+                ]),
+                &spy,
+            ),
+            0
+        );
+        assert_eq!(
+            spy.sites_calls.load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            ub_runtime::file_mtime_size(&cache_path).unwrap(),
+            stamp_before
+        );
     }
 }

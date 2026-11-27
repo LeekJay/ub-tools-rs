@@ -122,16 +122,17 @@ pub fn to_posix(path: &Path) -> String {
     }
 }
 
-fn walk_root(root: &Path, out: &mut Vec<PathBuf>) {
-    if !root.exists() {
+fn walk_root(root: &Path, out: &mut Vec<(PathBuf, bool)>) {
+    let resolved_root = resolve_path(root);
+    if !resolved_root.exists() {
         return;
     }
-    if root.is_file() {
-        out.push(root.to_path_buf());
+    if resolved_root.is_file() {
+        out.push((resolved_root, false));
         return;
     }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut stack = vec![(resolved_root, false)];
+    while let Some((dir, in_symlink)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -140,8 +141,10 @@ fn walk_root(root: &Path, out: &mut Vec<PathBuf>) {
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
+            let is_sym = file_type.is_symlink();
+            let child_sym = in_symlink || is_sym;
             // Follow symlinks when determining directory vs file, matching os.walk default.
-            let is_dir = if file_type.is_symlink() {
+            let is_dir = if is_sym {
                 path.is_dir()
             } else {
                 file_type.is_dir()
@@ -149,10 +152,10 @@ fn walk_root(root: &Path, out: &mut Vec<PathBuf>) {
             if is_dir {
                 let skip = entry.file_name().to_str().is_some_and(is_skipped_dir);
                 if !skip {
-                    stack.push(path);
+                    stack.push((path, child_sym));
                 }
             } else if language_of(&path).is_some() && !is_test_file(&path) {
-                out.push(path);
+                out.push((path, child_sym));
             }
         }
     }
@@ -165,8 +168,12 @@ pub fn iter_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     for root in roots {
         raw.clear();
         walk_root(root, &mut raw);
-        for path in &raw {
-            let resolved = resolve_path(path);
+        for (path, needs_resolve) in raw.drain(..) {
+            let resolved = if needs_resolve {
+                resolve_path(&path)
+            } else {
+                path
+            };
             let key = to_posix(&resolved);
             unique.entry(key).or_insert(resolved);
         }

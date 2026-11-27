@@ -16,6 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 tree-sitter = "0.27.2"
 tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"

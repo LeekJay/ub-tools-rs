@@ -1,0 +1,330 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+struct TempDirGuard(PathBuf);
+
+impl TempDirGuard {
+    fn new(prefix: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        Self(dir)
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_mutator(cwd: &Path, cache_dir: &Path, args: &[&str], extra_envs: &[(&str, &str)]) -> Output {
+    let bin = Path::new(env!("CARGO_BIN_EXE_mutator"));
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("UB_TOOLS_CACHE_DIR", cache_dir)
+        .env_remove("UB_TOOLS_NO_CACHE");
+    for (k, v) in extra_envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run mutator binary")
+}
+
+fn single_cache_file(cache_dir: &Path) -> PathBuf {
+    let files: Vec<PathBuf> = fs::read_dir(cache_dir)
+        .expect("read cache dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("cache"))
+        .collect();
+    assert_eq!(files.len(), 1, "expected 1 cache file, got {files:?}");
+    files.into_iter().next().unwrap()
+}
+
+fn python_bin() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
+#[test]
+fn warm_cache_matches_uncached_scan_skips_read_and_invalidates_on_edits_and_corrupt_cache() {
+    let repo = TempDirGuard::new("mutator_it_scan_cache");
+    let cache_dir = TempDirGuard::new("mutator_it_cache_dir");
+    let root = &repo.0;
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    let py_file = root.join("src").join("demo.py");
+    let py_src = "def add(a, b):\n    if a > 0:\n        return a + b\n    return 0\n";
+    fs::write(&py_file, py_src).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let rs_file = root.join("src").join("lib.rs");
+    fs::write(&rs_file, "pub fn inc(x: i32) -> i32 { x + 1 }\n").unwrap();
+
+    // Uncached baseline output.
+    let uncached = run_mutator(
+        root,
+        &cache_dir.0,
+        &["--scan", "--no-coverage", "--no-cache"],
+        &[],
+    );
+    assert_eq!(uncached.status.code(), Some(0));
+    assert!(
+        !cache_dir.0.exists() || fs::read_dir(&cache_dir.0).unwrap().next().is_none(),
+        "--no-cache must not create cache files"
+    );
+    let uncached_stdout = String::from_utf8(uncached.stdout).unwrap();
+    assert!(uncached_stdout.contains("src/demo.py"));
+    assert!(uncached_stdout.contains("src/lib.rs"));
+
+    // UB_TOOLS_NO_CACHE=1 also bypasses cache creation.
+    let env_disabled = run_mutator(
+        root,
+        &cache_dir.0,
+        &["--scan", "--no-coverage"],
+        &[("UB_TOOLS_NO_CACHE", "1")],
+    );
+    assert_eq!(env_disabled.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(env_disabled.stdout).unwrap(),
+        uncached_stdout
+    );
+    assert!(
+        !cache_dir.0.exists() || fs::read_dir(&cache_dir.0).unwrap().next().is_none(),
+        "UB_TOOLS_NO_CACHE=1 must not create cache files"
+    );
+
+    // Cold cached run populates cache and matches uncached output verbatim.
+    let cold = run_mutator(root, &cache_dir.0, &["--scan", "--no-coverage"], &[]);
+    assert_eq!(cold.status.code(), Some(0));
+    assert_eq!(String::from_utf8(cold.stdout).unwrap(), uncached_stdout);
+    let cache_file = single_cache_file(&cache_dir.0);
+    let cache_bytes = fs::read(&cache_file).unwrap();
+
+    // Warm run with same mtime+size: replace demo.py with invalid UTF-8 of identical byte length and
+    // restore original mtime to prove fs::read is completely skipped when history is empty.
+    let orig_mtime = fs::metadata(&py_file).unwrap().modified().unwrap();
+    let mut invalid_bytes = vec![0xFF; py_src.len()];
+    invalid_bytes[0] = b'#';
+    fs::write(&py_file, &invalid_bytes).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&py_file)
+        .unwrap()
+        .set_modified(orig_mtime)
+        .unwrap();
+    assert_eq!(fs::metadata(&py_file).unwrap().len(), py_src.len() as u64);
+
+    let warm = run_mutator(root, &cache_dir.0, &["--scan", "--no-coverage"], &[]);
+    assert_eq!(
+        warm.status.code(),
+        Some(0),
+        "warm scan unexpectedly read invalid UTF-8 bytes; stderr: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(String::from_utf8(warm.stdout).unwrap(), uncached_stdout);
+    assert_eq!(fs::read(&cache_file).unwrap(), cache_bytes);
+
+    // Restore valid Python and verify manifest edit (`Cargo.toml`) invalidates cached Rust sites.
+    fs::write(&py_file, py_src).unwrap();
+    let warm_restored = run_mutator(root, &cache_dir.0, &["--scan", "--no-coverage"], &[]);
+    assert_eq!(warm_restored.status.code(), Some(0));
+    let before_manifest_edit = fs::read(&cache_file).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.1\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let after_manifest = run_mutator(root, &cache_dir.0, &["--scan", "--no-coverage"], &[]);
+    assert_eq!(after_manifest.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(after_manifest.stdout).unwrap(),
+        uncached_stdout
+    );
+    let after_manifest_bytes = fs::read(&cache_file).unwrap();
+    assert_ne!(after_manifest_bytes, before_manifest_edit);
+
+    // Source edit invalidates and reflects new sites.
+    fs::write(
+        &py_file,
+        "def add(a, b):\n    if a >= 0:\n        return a - b\n    return 0\n",
+    )
+    .unwrap();
+    let after_source_edit = run_mutator(root, &cache_dir.0, &["--scan", "--no-coverage"], &[]);
+    assert_eq!(after_source_edit.status.code(), Some(0));
+    let edited_stdout = String::from_utf8(after_source_edit.stdout).unwrap();
+    assert_ne!(edited_stdout, uncached_stdout);
+    assert!(edited_stdout.contains(">="));
+
+    // Corrupt cache is tolerated cleanly and healed on next run.
+    fs::write(&cache_file, b"CORRUPT_UBC_BLOB").unwrap();
+    let healed = run_mutator(root, &cache_dir.0, &["--scan", "--no-coverage"], &[]);
+    assert_eq!(healed.status.code(), Some(0));
+    assert_eq!(String::from_utf8(healed.stdout).unwrap(), edited_stdout);
+    assert!(fs::read(&cache_file).unwrap().starts_with(b"UBC1"));
+}
+
+#[test]
+fn json_outputs_empty_scan_and_mutate_exit_codes_cleanly() {
+    let empty_repo = TempDirGuard::new("mutator_it_empty_json");
+    let cache_dir = TempDirGuard::new("mutator_it_json_cache");
+
+    // Empty repo --scan --json.
+    let empty_scan = run_mutator(
+        &empty_repo.0,
+        &cache_dir.0,
+        &["--scan", "--no-coverage", "--json"],
+        &[],
+    );
+    assert_eq!(empty_scan.status.code(), Some(0));
+    let es_val: serde_json::Value =
+        serde_json::from_slice(&empty_scan.stdout).expect("valid empty scan json");
+    assert_eq!(es_val["version"], 1);
+    assert_eq!(es_val["tool"], "mutator");
+    assert_eq!(es_val["mode"], "scan");
+    assert_eq!(es_val["summary"]["files"], 0);
+    assert_eq!(es_val["summary"]["sites"], 0);
+    assert_eq!(es_val["files"], serde_json::json!([]));
+
+    // Empty repo mutate --json.
+    let empty_mutate = run_mutator(
+        &empty_repo.0,
+        &cache_dir.0,
+        &["--no-coverage", "--json"],
+        &[],
+    );
+    assert_eq!(empty_mutate.status.code(), Some(0));
+    let em_val: serde_json::Value =
+        serde_json::from_slice(&empty_mutate.stdout).expect("valid empty mutate json");
+    assert_eq!(em_val["version"], 1);
+    assert_eq!(em_val["tool"], "mutator");
+    assert_eq!(em_val["mode"], "mutate");
+    assert_eq!(em_val["summary"]["sites"], 0);
+    assert_eq!(em_val["summary"]["score"], serde_json::Value::Null);
+    assert_eq!(em_val["summary"]["baseline_failed"], false);
+
+    // Populated Python repo for --scan --json and mutation exit codes 0, 3, 2.
+    let repo = TempDirGuard::new("mutator_it_mutate_json");
+    let root = &repo.0;
+    fs::create_dir_all(root.join("src")).unwrap();
+    let py_file = root.join("src").join("demo.py");
+    fs::write(
+        &py_file,
+        "def add(a, b):\n    if a > 0:\n        return a + b\n    return 0\n",
+    )
+    .unwrap();
+
+    let scan_json = run_mutator(
+        root,
+        &cache_dir.0,
+        &["--scan", "--no-coverage", "--json"],
+        &[],
+    );
+    assert_eq!(scan_json.status.code(), Some(0));
+    assert!(scan_json.stderr.is_empty());
+    let scan_str = String::from_utf8(scan_json.stdout).unwrap();
+    assert!(!scan_str.contains("Scan:"));
+    let scan_val: serde_json::Value = serde_json::from_str(&scan_str).unwrap();
+    assert_eq!(scan_val["mode"], "scan");
+    assert_eq!(scan_val["summary"]["files"], 1);
+    assert!(scan_val["summary"]["sites"].as_u64().unwrap() >= 2);
+    assert_eq!(scan_val["summary"]["covered"], 0);
+    assert_eq!(scan_val["summary"]["uncovered"], 0);
+    assert_eq!(
+        scan_val["files"][0]["sites"][0]["covered"],
+        serde_json::Value::Null
+    );
+
+    let py = python_bin();
+    let pass_cmd = format!(
+        "{py} -c \"import sys; sys.path.insert(0, 'src'); from demo import add; raise SystemExit(0 if add(2, 3) == 5 else 1)\""
+    );
+
+    // Exit 0: line 3 only (`a + b` killed).
+    let killed = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--mutate-all",
+            "--lines",
+            "3",
+            "--max-workers",
+            "1",
+            "--json",
+            "--test-command",
+            &pass_cmd,
+            "src/demo.py",
+        ],
+        &[],
+    );
+    assert_eq!(killed.status.code(), Some(0));
+    let killed_stdout = String::from_utf8(killed.stdout).unwrap();
+    assert!(!killed_stdout.contains("KILLED"));
+    assert!(!killed_stdout.contains("Wrote"));
+    assert!(String::from_utf8_lossy(&killed.stderr).contains("Wrote "));
+    let killed_val: serde_json::Value = serde_json::from_str(&killed_stdout).unwrap();
+    assert_eq!(killed_val["mode"], "mutate");
+    assert_eq!(killed_val["summary"]["baseline_failed"], false);
+    assert!(killed_val["summary"]["killed"].as_u64().unwrap() >= 1);
+    assert_eq!(killed_val["summary"]["survived"], 0);
+    assert_eq!(killed_val["summary"]["score"], 1.0);
+    assert!(!killed_val["written"].as_array().unwrap().is_empty());
+
+    // Exit 3: full file (at least one mutant survives).
+    let survived = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--mutate-all",
+            "--max-workers",
+            "1",
+            "--json",
+            "--test-command",
+            &pass_cmd,
+            "src/demo.py",
+        ],
+        &[],
+    );
+    assert_eq!(survived.status.code(), Some(3));
+    let survived_stdout = String::from_utf8(survived.stdout).unwrap();
+    assert!(!survived_stdout.contains("SURVIVED"));
+    let survived_val: serde_json::Value = serde_json::from_str(&survived_stdout).unwrap();
+    assert!(survived_val["summary"]["survived"].as_u64().unwrap() >= 1);
+    assert!(survived_val["summary"]["score"].as_f64().unwrap() < 1.0);
+    assert!(
+        survived_val["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["status"] == "survived")
+    );
+
+    // Exit 2: baseline failure.
+    let fail_cmd = format!("{py} -c \"raise SystemExit(1)\"");
+    let baseline = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--mutate-all",
+            "--json",
+            "--test-command",
+            &fail_cmd,
+            "src/demo.py",
+        ],
+        &[],
+    );
+    assert_eq!(baseline.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&baseline.stderr).contains("Baseline failed"));
+    let base_val: serde_json::Value = serde_json::from_slice(&baseline.stdout).unwrap();
+    assert_eq!(base_val["mode"], "mutate");
+    assert_eq!(base_val["summary"]["baseline_failed"], true);
+    assert_eq!(base_val["summary"]["score"], serde_json::Value::Null);
+}

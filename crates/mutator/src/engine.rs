@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::metrics::{load_history, source_key, write_results};
-use crate::model::{FormResult, History, RunResult, Site};
+use crate::model::{FormResult, History, RunResult, ScanFileData, Site};
 use crate::path_util::{resolve_path, to_posix};
 use crate::report::format_scan;
 use crate::runner::{Command, Runner, display_command};
@@ -407,6 +407,39 @@ pub struct MutateOptions<'a> {
     pub xcode_destination: Option<&'a str>,
 }
 
+/// Options for scanning mutation sites in a single file.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanOptions<'a> {
+    pub covered_lines: Option<&'a HashSet<usize>>,
+    pub ignore_coverage: bool,
+    pub lines: Option<&'a HashSet<usize>>,
+    pub cached_sites: Option<&'a [Site]>,
+}
+
+/// Mutate one file with a preloaded prior snapshot `history` and optional pre-discovered `cached_sites`.
+#[allow(clippy::too_many_arguments)]
+pub fn mutate_file_cached_with_history<R: Runner + Sync, E: EngineProvider>(
+    path: &Path,
+    root: &Path,
+    runner: &R,
+    opts: &MutateOptions<'_>,
+    baselines: &mut BaselineCache,
+    history: &History,
+    cached_sites: Option<&[Site]>,
+    provider: &E,
+) -> RunResult {
+    mutate_file_impl(
+        path,
+        root,
+        runner,
+        opts,
+        baselines,
+        Some(history),
+        cached_sites,
+        provider,
+    )
+}
+
 /// Mutate one file with a preloaded prior snapshot `history`.
 #[allow(clippy::too_many_arguments)]
 pub fn mutate_file_with_history<R: Runner + Sync, E: EngineProvider>(
@@ -418,7 +451,16 @@ pub fn mutate_file_with_history<R: Runner + Sync, E: EngineProvider>(
     history: &History,
     provider: &E,
 ) -> RunResult {
-    mutate_file_impl(path, root, runner, opts, baselines, Some(history), provider)
+    mutate_file_impl(
+        path,
+        root,
+        runner,
+        opts,
+        baselines,
+        Some(history),
+        None,
+        provider,
+    )
 }
 
 /// Mutate one file and write its namespaces into `.metrics/mutate`.
@@ -430,9 +472,10 @@ pub fn mutate_file_with<R: Runner + Sync, E: EngineProvider>(
     baselines: &mut BaselineCache,
     provider: &E,
 ) -> RunResult {
-    mutate_file_impl(path, root, runner, opts, baselines, None, provider)
+    mutate_file_impl(path, root, runner, opts, baselines, None, None, provider)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
     path: &Path,
     root: &Path,
@@ -440,6 +483,7 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
     opts: &MutateOptions<'_>,
     baselines: &mut BaselineCache,
     preloaded_history: Option<&History>,
+    cached_sites: Option<&[Site]>,
     provider: &E,
 ) -> RunResult {
     let root = resolve_path(root);
@@ -466,7 +510,10 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
         };
     };
 
-    let found = provider.sites_in_file(&source, &path, &root, &file_key);
+    let found = match cached_sites {
+        Some(sites) => sites.to_vec(),
+        None => provider.sites_in_file(&source, &path, &root, &file_key),
+    };
     let covered = coverage_map(&found, opts.covered_lines, opts.ignore_coverage);
     warn_uncovered(&file_key, &found, opts.covered_lines, opts.ignore_coverage);
 
@@ -569,6 +616,53 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
     }
 }
 
+fn read_utf8_source(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+/// Inventory mutation sites returning structured `ScanFileData` and using `opts.cached_sites` when valid.
+///
+/// On a cache hit with empty prior form history, avoids reading source bytes from disk.
+pub fn scan_file_cached_with_history<E: EngineProvider>(
+    path: &Path,
+    root: &Path,
+    opts: &ScanOptions<'_>,
+    history: &History,
+    provider: &E,
+) -> Result<ScanFileData, String> {
+    scan_file_core(
+        path,
+        root,
+        opts,
+        Some(history),
+        true,
+        provider,
+        read_utf8_source,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_file_resolved_with_history<E: EngineProvider>(
+    resolved_path: &Path,
+    resolved_root: &Path,
+    file_key: &str,
+    opts: &ScanOptions<'_>,
+    history: &History,
+    provider: &E,
+) -> Result<ScanFileData, String> {
+    scan_file_resolved_core(
+        resolved_path,
+        resolved_root,
+        file_key.to_string(),
+        opts,
+        Some(history),
+        true,
+        provider,
+        read_utf8_source,
+    )
+}
+
 /// Inventory mutation sites with a preloaded prior snapshot `history`.
 pub fn scan_file_with_history<E: EngineProvider>(
     path: &Path,
@@ -579,15 +673,27 @@ pub fn scan_file_with_history<E: EngineProvider>(
     history: &History,
     provider: &E,
 ) -> Result<String, String> {
-    scan_file_impl(
-        path,
-        root,
+    let opts = ScanOptions {
         covered_lines,
         ignore_coverage,
         lines,
+        cached_sites: None,
+    };
+    let data = scan_file_core(
+        path,
+        root,
+        &opts,
         Some(history),
+        false,
         provider,
-    )
+        read_utf8_source,
+    )?;
+    Ok(format_scan(
+        &data.file,
+        &data.sites,
+        &data.changed,
+        data.covered.as_ref(),
+    ))
 }
 
 /// Inventory mutation sites without running tests or writing metrics.
@@ -599,51 +705,108 @@ pub fn scan_file_with<E: EngineProvider>(
     lines: Option<&HashSet<usize>>,
     provider: &E,
 ) -> Result<String, String> {
-    scan_file_impl(
-        path,
-        root,
+    let opts = ScanOptions {
         covered_lines,
         ignore_coverage,
         lines,
-        None,
-        provider,
-    )
+        cached_sites: None,
+    };
+    let data = scan_file_core(path, root, &opts, None, false, provider, read_utf8_source)?;
+    Ok(format_scan(
+        &data.file,
+        &data.sites,
+        &data.changed,
+        data.covered.as_ref(),
+    ))
 }
 
-fn scan_file_impl<E: EngineProvider>(
+fn scan_file_core<E: EngineProvider, F>(
     path: &Path,
     root: &Path,
-    covered_lines: Option<&HashSet<usize>>,
-    ignore_coverage: bool,
-    lines: Option<&HashSet<usize>>,
+    opts: &ScanOptions<'_>,
     preloaded_history: Option<&History>,
+    track_discovered: bool,
     provider: &E,
-) -> Result<String, String> {
+    read_source: F,
+) -> Result<ScanFileData, String>
+where
+    F: Fn(&Path) -> Result<String, String>,
+{
     let root = resolve_path(root);
     let path = resolve_path(path);
     let file_key = source_key(&path, &root)?;
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-    let source = String::from_utf8(bytes).map_err(|e| e.to_string())?;
-    let mut found = provider.sites_in_file(&source, &path, &root, &file_key);
-    if let Some(line_filter) = lines {
-        found.retain(|s| line_filter.contains(&s.line));
-    }
-    let covered = if !ignore_coverage && covered_lines.is_some() {
-        Some(coverage_map(&found, covered_lines, ignore_coverage))
-    } else {
-        None
-    };
+    scan_file_resolved_core(
+        &path,
+        &root,
+        file_key,
+        opts,
+        preloaded_history,
+        track_discovered,
+        provider,
+        read_source,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_file_resolved_core<E: EngineProvider, F>(
+    path: &Path,
+    root: &Path,
+    file_key: String,
+    opts: &ScanOptions<'_>,
+    preloaded_history: Option<&History>,
+    track_discovered: bool,
+    provider: &E,
+    read_source: F,
+) -> Result<ScanFileData, String>
+where
+    F: Fn(&Path) -> Result<String, String>,
+{
     let owned_history;
     let history = match preloaded_history {
         Some(h) => h,
         None => {
-            owned_history = load_history(&root, &file_key);
+            owned_history = load_history(root, &file_key);
             &owned_history
         }
     };
+
+    let mut source_opt: Option<String> = None;
+    let (mut found, discovered_sites) = match opts.cached_sites {
+        Some(cached) => (cached.to_vec(), None),
+        None => {
+            let source = read_source(path)?;
+            let unfiltered = provider.sites_in_file(&source, path, root, &file_key);
+            let discovered = if track_discovered {
+                Some(unfiltered.clone())
+            } else {
+                None
+            };
+            source_opt = Some(source);
+            (unfiltered, discovered)
+        }
+    };
+
+    if let Some(line_filter) = opts.lines {
+        found.retain(|s| line_filter.contains(&s.line));
+    }
+
+    let covered = if !opts.ignore_coverage && opts.covered_lines.is_some() {
+        Some(coverage_map(
+            &found,
+            opts.covered_lines,
+            opts.ignore_coverage,
+        ))
+    } else {
+        None
+    };
+
     let mut changed = HashSet::new();
     if !history.forms.is_empty() {
-        let digests = provider.form_digests(&source, &path, &root);
+        let source = match source_opt {
+            Some(s) => s,
+            None => read_source(path)?,
+        };
+        let digests = provider.form_digests(&source, path, root);
         for (key, digest) in &digests {
             let same = history
                 .forms
@@ -654,7 +817,14 @@ fn scan_file_impl<E: EngineProvider>(
             }
         }
     }
-    Ok(format_scan(&file_key, &found, &changed, covered.as_ref()))
+
+    Ok(ScanFileData {
+        file: file_key,
+        sites: found,
+        changed,
+        covered,
+        discovered_sites,
+    })
 }
 
 /// Ordered keys helper used by tests and diagnostics.
@@ -773,6 +943,247 @@ mod tests {
                 .unwrap();
         assert!(out.contains("0 mutation sites"));
         assert_eq!(prov.0.get(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_cached_skips_read_and_sites_when_history_empty_and_filters_lines() {
+        use crate::model::PriorForm;
+        use crate::runner::Runner;
+        use std::cell::Cell;
+
+        struct SpyProvider {
+            sites_calls: Cell<usize>,
+            digest_calls: Cell<usize>,
+            span_calls: Cell<usize>,
+        }
+        impl DiscoverProvider for SpyProvider {
+            fn language_of(&self, _path: &Path) -> Option<&'static str> {
+                Some("python")
+            }
+            fn is_test_filename(&self, _name: &str) -> bool {
+                false
+            }
+            fn skip_dirs(&self) -> &[&str] {
+                &[]
+            }
+            fn test_dirs(&self) -> &[&str] {
+                &[]
+            }
+        }
+        impl EngineProvider for SpyProvider {
+            fn sites_in_file(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+                file_key: &str,
+            ) -> Vec<Site> {
+                self.sites_calls.set(self.sites_calls.get() + 1);
+                vec![
+                    Site {
+                        file: file_key.to_string(),
+                        namespace: "demo".to_string(),
+                        form_id: "defn/f".to_string(),
+                        name: "f".to_string(),
+                        line: 2,
+                        start: 10,
+                        end: 11,
+                        original: ">".to_string(),
+                        mutant: ">=".to_string(),
+                        category: "comparison".to_string(),
+                        mutation_id: "m1".to_string(),
+                        anchor_line: 2,
+                    },
+                    Site {
+                        file: file_key.to_string(),
+                        namespace: "demo".to_string(),
+                        form_id: "defn/f".to_string(),
+                        name: "f".to_string(),
+                        line: 3,
+                        start: 20,
+                        end: 21,
+                        original: "+".to_string(),
+                        mutant: "-".to_string(),
+                        category: "arithmetic".to_string(),
+                        mutation_id: "m2".to_string(),
+                        anchor_line: 3,
+                    },
+                ]
+            }
+            fn form_digests(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+            ) -> HashMap<(String, String), String> {
+                self.digest_calls.set(self.digest_calls.get() + 1);
+                HashMap::from([(("demo".into(), "defn/f".into()), "new_hash".into())])
+            }
+            fn form_spans(&self, _source: &str, _path: &Path, _root: &Path) -> FormSpanMap {
+                self.span_calls.set(self.span_calls.get() + 1);
+                HashMap::from([(("demo".into(), "defn/f".into()), (1, 3, "f".into(), false))])
+            }
+            fn test_plan(
+                &self,
+                root: &Path,
+                _source: &Path,
+                _language: &str,
+                _override_cmd: Option<&str>,
+                _xcode_scheme: Option<&str>,
+                _xcode_destination: Option<&str>,
+            ) -> (Command, PathBuf) {
+                (Command::Argv(vec!["true".into()]), root.to_path_buf())
+            }
+        }
+        struct NoopRunner;
+        impl Runner for NoopRunner {
+            fn is_verbose(&self) -> bool {
+                false
+            }
+            fn run(
+                &self,
+                _command: &Command,
+                _cwd: &Path,
+                _timeout: Option<f64>,
+            ) -> crate::runner::CommandResult {
+                crate::runner::CommandResult {
+                    code: 0,
+                    output: String::new(),
+                    timed_out: false,
+                    seconds: 0.01,
+                }
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("mutator_cached_eng_{}", uuid::Uuid::new_v4()));
+        let file = root.join("src").join("demo.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "def f(x):\n    if x > 0:\n        return x + 1\n").unwrap();
+
+        let prov = SpyProvider {
+            sites_calls: Cell::new(0),
+            digest_calls: Cell::new(0),
+            span_calls: Cell::new(0),
+        };
+        let empty_hist = History::default();
+
+        // 1. Cache miss: reads source once, runs sites_in_file once, returns unfiltered discovered_sites.
+        let read_calls = Cell::new(0usize);
+        let line_filter = HashSet::from([2usize]);
+        let miss = scan_file_core(
+            &file,
+            &root,
+            &ScanOptions {
+                covered_lines: None,
+                ignore_coverage: true,
+                lines: Some(&line_filter),
+                cached_sites: None,
+            },
+            Some(&empty_hist),
+            true,
+            &prov,
+            |p| {
+                read_calls.set(read_calls.get() + 1);
+                read_utf8_source(p)
+            },
+        )
+        .unwrap();
+        assert_eq!(read_calls.get(), 1);
+        assert_eq!(prov.sites_calls.get(), 1);
+        assert_eq!(prov.digest_calls.get(), 0);
+        assert_eq!(miss.sites.len(), 1);
+        assert_eq!(miss.sites[0].line, 2);
+        let cached = miss.discovered_sites.unwrap();
+        assert_eq!(cached.len(), 2);
+
+        // 2. Cache hit + empty history: skips BOTH fs::read and sites_in_file, still applies line filter!
+        let hit_no_hist = scan_file_core(
+            &file,
+            &root,
+            &ScanOptions {
+                covered_lines: None,
+                ignore_coverage: true,
+                lines: Some(&line_filter),
+                cached_sites: Some(&cached),
+            },
+            Some(&empty_hist),
+            true,
+            &prov,
+            |_| panic!("fs::read must be skipped on cache hit with empty history"),
+        )
+        .unwrap();
+        assert_eq!(prov.sites_calls.get(), 1);
+        assert_eq!(prov.digest_calls.get(), 0);
+        assert!(hit_no_hist.discovered_sites.is_none());
+        assert_eq!(hit_no_hist.sites, miss.sites);
+
+        // 3. Cache hit + non-empty history: skips sites_in_file, reads source ONLY for form_digests.
+        let mut prior = History::default();
+        prior.forms.insert(
+            ("demo".into(), "defn/f".into()),
+            PriorForm {
+                namespace: "demo".into(),
+                id: "defn/f".into(),
+                digest: "old_hash".into(),
+                file: "src/demo.py".into(),
+            },
+        );
+        let read_for_hist = Cell::new(0usize);
+        let hit_with_hist = scan_file_core(
+            &file,
+            &root,
+            &ScanOptions {
+                covered_lines: None,
+                ignore_coverage: true,
+                lines: None,
+                cached_sites: Some(&cached),
+            },
+            Some(&prior),
+            true,
+            &prov,
+            |p| {
+                read_for_hist.set(read_for_hist.get() + 1);
+                read_utf8_source(p)
+            },
+        )
+        .unwrap();
+        assert_eq!(read_for_hist.get(), 1);
+        assert_eq!(prov.sites_calls.get(), 1);
+        assert_eq!(prov.digest_calls.get(), 1);
+        assert_eq!(
+            hit_with_hist.changed,
+            HashSet::from([("demo".to_string(), "defn/f".to_string())])
+        );
+        assert_eq!(hit_with_hist.sites.len(), 2);
+
+        // 4. Mutate cached variant skips sites_in_file when cached_sites is provided.
+        let mut baselines = BaselineCache::new();
+        let mutate_opts = MutateOptions {
+            covered_lines: None,
+            ignore_coverage: false,
+            mutate_all: false,
+            lines: None,
+            test_command: None,
+            timeout_factor: 10.0,
+            mutation_warning: 50,
+            max_workers: Some(1),
+            xcode_scheme: None,
+            xcode_destination: None,
+        };
+        let res = mutate_file_cached_with_history(
+            &file,
+            &root,
+            &NoopRunner,
+            &mutate_opts,
+            &mut baselines,
+            &empty_hist,
+            Some(&cached),
+            &prov,
+        );
+        assert_eq!(prov.sites_calls.get(), 1);
+        assert_eq!(res.sites.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
