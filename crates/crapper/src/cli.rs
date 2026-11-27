@@ -54,7 +54,8 @@ Options:
   --changed                     Analyze added and modified source files from
                                 git status.
   --changed-functions           Analyze only functions overlapping git diff
-                                changes (plus all functions in new files).
+                                changes (plus all functions in new files;
+                                implies --no-metrics).
   --base <ref>                  Git base ref for --changed or
                                 --changed-functions (compares <ref> against
                                 working tree).
@@ -279,6 +280,9 @@ pub fn parse_args(args: &[String]) -> Options {
     }
 
     options.no_metrics = options.no_metrics || ub_runtime::env_no_metrics();
+    if options.changed_functions {
+        options.no_metrics = true;
+    }
     if options.action != "help" && ub_runtime::env_no_cache() {
         options.no_cache = true;
     }
@@ -553,8 +557,22 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     let mut bundle = coverage_bundle(&options, &root, &files);
     let mut entries =
         analyze_resolved_files_with_cache(&files, &root, bundle.as_mut(), !options.no_cache);
+    let mut untouched_over_threshold = 0usize;
+    let mut untouched_worst: Option<f64> = None;
     if let Some(ref changed_map) = selection.lines_by_path {
-        entries.retain(|entry| entry_overlaps_changes(entry, changed_map));
+        let mut kept = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry_overlaps_changes(&entry, changed_map) {
+                kept.push(entry);
+            } else if let Some(threshold) = options.threshold
+                && let Some(crap) = entry.crap
+                && crap > threshold
+            {
+                untouched_over_threshold += 1;
+                untouched_worst = Some(untouched_worst.map_or(crap, |w| w.max(crap)));
+            }
+        }
+        entries = kept;
     }
     let written_path = if options.no_metrics {
         None
@@ -576,6 +594,19 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     let _ = out.flush();
     if let Some(metrics) = written_path {
         let _ = writeln!(err, "Wrote {}", metrics.display());
+    }
+    if untouched_over_threshold > 0
+        && let (Some(threshold), Some(worst)) = (options.threshold, untouched_worst)
+    {
+        let fn_word = if untouched_over_threshold == 1 {
+            "function"
+        } else {
+            "functions"
+        };
+        let _ = writeln!(
+            err,
+            "Note: {untouched_over_threshold} untouched {fn_word} in changed files exceed CRAP {threshold:.1} (worst {worst:.1})."
+        );
     }
     threshold_status(&options, &entries, err)
 }
@@ -950,11 +981,13 @@ mod tests {
     fn options_and_help_support_changed_functions_and_base() {
         let help = help_text();
         assert!(help.contains("--changed-functions"));
+        assert!(help.contains("implies --no-metrics"));
         assert!(help.contains("--base <ref>"));
 
         let fn_only = parse_args(&["--changed-functions".to_string()]);
         assert_eq!(fn_only.action, "analyze");
         assert!(fn_only.changed_functions);
+        assert!(fn_only.no_metrics);
         assert_eq!(fn_only.base, None);
 
         let with_base = parse_args(&[
@@ -1052,20 +1085,33 @@ mod tests {
         let whole_json: serde_json::Value = serde_json::from_str(&whole_out).unwrap();
         assert_eq!(whole_json["summary"]["functions"], 2);
 
-        let (fn_code, fn_out, _) = run_fixture_cli(
-            &dir,
-            &["--changed-functions", "--no-metrics", "--json"],
-            "10.0",
-        );
+        let (fn_code, fn_out, fn_err) =
+            run_fixture_cli(&dir, &["--changed-functions", "--json"], "10.0");
         assert_eq!(
             fn_code, 0,
             "--changed-functions should ignore untouched legacy_giant: {fn_out}"
+        );
+        assert!(
+            !metrics_path(root).exists(),
+            "--changed-functions must imply --no-metrics and not write .metrics/crap.edn"
+        );
+        assert!(
+            fn_err.contains("Note: 1 untouched function in changed files exceed CRAP 10.0 (worst "),
+            "expected untouched legacy reminder in stderr, got: {fn_err}"
         );
         let fn_json: serde_json::Value = serde_json::from_str(&fn_out).unwrap();
         assert_eq!(fn_json["summary"]["functions"], 1);
         assert_eq!(fn_json["entries"][0]["name"], "small_ok");
         assert_eq!(fn_json["entries"][0]["start_line"], 9);
         assert_eq!(fn_json["entries"][0]["end_line"], 10);
+
+        let (high_code, _, high_err) =
+            run_fixture_cli(&dir, &["--changed-functions", "--json"], "100.0");
+        assert_eq!(high_code, 0);
+        assert!(
+            !high_err.contains("Note:"),
+            "unexpected reminder below high threshold: {high_err}"
+        );
 
         // Add untracked new file and verify `--changed-functions` picks up its functions.
         fs::write(

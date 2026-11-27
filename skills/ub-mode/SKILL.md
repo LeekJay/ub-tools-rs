@@ -107,7 +107,7 @@ Every time you are asked to make a change follow:
 
 ## Crapper
 
-* Use the crapper tool (`--changed-functions --json`, adding `--base <ref>` for committed branch diffs and `--no-metrics` during intermediate checks to keep `.metrics/` clean; use `--changed` or target paths for whole-file scans).
+* Use the crapper tool (`--changed-functions --json`, adding `--base <ref>` for committed branch diffs; implies `--no-metrics` to keep `.metrics/` intact and notes untouched legacy debt on `stderr`; use `--changed` or target paths for whole-file scans).
 * Reduce each function under  CRAP 10 by splitting it, by testing it, or both.
 * Consider whether case statements are worth reducing.
 
@@ -118,7 +118,7 @@ Every time you are asked to make a change follow:
 ## Mutator
 
 * Use the mutator tool (run `--scan --json` first to inspect sites, exclude logging, telemetry, and non-decision boilerplate, then pass `--json` with `--lines` targeting only changed branch and decision logic).
-* When the default test suite is slow, pass `--test-command` scoped to the matching unit test file and narrow `--lines` so `selected_sites * single_run_seconds / workers` stays within ~2 to 3 minutes per pass.
+* When the default test suite is slow, pass `--test-command` scoped to the matching unit test file; if high-risk sites exceed a ~2 to 3 minute batch (`selected_sites * single_run_seconds / workers`), split them into sequential `--lines` batches rather than skipping risky branches or weakening assertions.
 * Cover the uncovered.
 * Kill the survivors.
 * Delete dead code.

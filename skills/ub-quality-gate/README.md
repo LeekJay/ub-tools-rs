@@ -21,7 +21,7 @@ Acts strictly as an objective verifier (never modifying code, installing tools, 
 
 | Gate | Tool | Configured Read-Only Flags in `SKILL.md` |
 | --- | --- | --- |
-| Complexity | [`crapper`](../../crates/crapper) | `--changed-functions --no-metrics --json --threshold 10` (optional `--base <ref>` for branch diffs, `--use-existing-coverage` when fresh coverage is on disk) |
+| Complexity | [`crapper`](../../crates/crapper) | `--changed-functions --json --threshold 10` (implies `--no-metrics`, optional `--base <ref>`, prints untouched over-threshold legacy counts on `stderr`) |
 | Duplication | [`dryer`](../../crates/dryer) | `--no-metrics --json --threshold 0.8` across the relevant source root, focusing findings on changed files |
 | Mutation sites | [`mutator`](../../crates/mutator) | `--scan --json` first to filter out non-decision lines, then `--lines`, scoped `--test-command` for slow runners, and `--json` (streams live progress on `stderr`, writes `.metrics/mutate/*.edn`) |
 
