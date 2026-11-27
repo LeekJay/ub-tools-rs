@@ -56,6 +56,7 @@ Options:
   --use-existing-coverage       Read coverage already on disk. Do not rerun tests.
   --coverage-command <cmd>      Run this command instead of the per-language
                                 coverage tools, then read the reports it wrote.
+  --no-metrics                  Skip writing .metrics/crap.edn. Print report only.
   --threshold <number>          Exit 2 when the worst CRAP score is above this.
 
 Arguments:
@@ -100,6 +101,7 @@ pub struct Options {
     pub source_roots: Vec<String>,
     pub positionals: Vec<String>,
     pub no_coverage: bool,
+    pub no_metrics: bool,
     pub use_existing_coverage: bool,
     pub coverage_command: Option<String>,
     pub threshold: Option<f64>,
@@ -116,6 +118,7 @@ impl Default for Options {
             source_roots: Vec::new(),
             positionals: Vec::new(),
             no_coverage: false,
+            no_metrics: false,
             use_existing_coverage: false,
             coverage_command: None,
             threshold: None,
@@ -218,6 +221,10 @@ pub fn parse_args(args: &[String]) -> Options {
                 options.no_coverage = true;
                 index += 1;
             }
+            "--no-metrics" => {
+                options.no_metrics = true;
+                index += 1;
+            }
             "--use-existing-coverage" => {
                 options.use_existing_coverage = true;
                 index += 1;
@@ -255,6 +262,7 @@ pub fn parse_args(args: &[String]) -> Options {
         };
     }
 
+    options.no_metrics = options.no_metrics || ub_runtime::env_no_metrics();
     options
 }
 
@@ -421,6 +429,15 @@ fn coverage_bundle(options: &Options, root: &Path, files: &[PathBuf]) -> Option<
     if options.use_existing_coverage {
         return Some(load_bundle(root));
     }
+    let _cov_lock = ub_runtime::acquire_repo_lock(
+        "coverage",
+        root,
+        Some(&format!(
+            "Waiting for another coverage run on {}...",
+            root.display()
+        )),
+    )
+    .ok();
     let status = run_coverage(root, files, options.coverage_command.as_deref());
     if options
         .coverage_command
@@ -474,24 +491,219 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
         return 0;
     }
 
+    let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
+
     let mut bundle = coverage_bundle(&options, &root, &files);
     let entries = analyze_files(&files, &root, bundle.as_mut());
-    match write_metrics(&entries, &root) {
-        Ok(metrics) => {
-            let _ = write!(out, "{}", format_report(&entries));
-            let _ = out.flush();
-            let _ = writeln!(err, "Wrote {}", metrics.display());
-            threshold_status(&options, &entries, err)
+    let written_path = if options.no_metrics {
+        None
+    } else {
+        match write_metrics(&entries, &root) {
+            Ok(path) => Some(path),
+            Err(exc) => {
+                let _ = writeln!(err, "Failed to write metrics: {exc}");
+                return 1;
+            }
         }
-        Err(exc) => {
-            let _ = writeln!(err, "Failed to write metrics: {exc}");
-            1
-        }
+    };
+    let _ = write!(out, "{}", format_report(&entries));
+    let _ = out.flush();
+    if let Some(metrics) = written_path {
+        let _ = writeln!(err, "Wrote {}", metrics.display());
     }
+    threshold_status(&options, &entries, err)
 }
 
 pub fn run(args: &[String]) -> i32 {
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
     run_with_io(args, &mut stdout, &mut stderr)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::metrics::metrics_path;
+
+    use super::*;
+
+    const SUBPROCESS_MARKER: &str = "CRAPPER_TEST_NO_METRICS_SUBPROC";
+    const SUBPROCESS_EXPECT_ENV: &str = "CRAPPER_TEST_EXPECT_NO_METRICS";
+
+    static NEXT_DIR_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_DIR_ID.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "crapper-cli-{label}-{}-{nanos}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn create_branchy_fixture(dir: &TestDir) {
+        let src_dir = dir.0.join("src");
+        let cov_dir = dir.0.join("coverage");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::create_dir_all(&cov_dir).expect("create coverage dir");
+        fs::write(
+            src_dir.join("app.py"),
+            "def branchy(x):\n    if x > 0:\n        return 1\n    return 0\n",
+        )
+        .expect("write python fixture");
+        fs::write(
+            cov_dir.join("lcov.info"),
+            "SF:src/app.py\nDA:1,0\nDA:2,0\nDA:3,0\nDA:4,0\nend_of_record\n",
+        )
+        .expect("write lcov fixture");
+    }
+
+    fn run_fixture_cli(
+        dir: &TestDir,
+        extra_args: &[&str],
+        threshold: &str,
+    ) -> (i32, String, String) {
+        let root_str = dir.0.to_string_lossy().into_owned();
+        let mut args = vec![
+            "--root".to_string(),
+            root_str,
+            "--use-existing-coverage".to_string(),
+            "--threshold".to_string(),
+            threshold.to_string(),
+        ];
+        args.extend(extra_args.iter().map(|s| (*s).to_string()));
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_io(&args, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    fn assert_no_metrics_behavior(dir: &TestDir, extra_args: &[&str]) {
+        let (code_exceeded, out_exceeded, err_exceeded) = run_fixture_cli(dir, extra_args, "5.0");
+        assert_eq!(code_exceeded, 2, "expected threshold exit code 2");
+        assert!(out_exceeded.contains("CRAP Report"));
+        assert!(out_exceeded.contains("branchy"));
+        assert!(err_exceeded.contains("CRAP threshold exceeded:"));
+        assert!(!err_exceeded.contains("Wrote "));
+        assert!(!metrics_path(&dir.0).exists());
+        assert!(!dir.0.join(".metrics").exists());
+
+        let (code_ok, out_ok, err_ok) = run_fixture_cli(dir, extra_args, "10.0");
+        assert_eq!(code_ok, 0, "expected exit code 0 below threshold");
+        assert!(out_ok.contains("CRAP Report"));
+        assert!(out_ok.contains("branchy"));
+        assert!(!err_ok.contains("Wrote "));
+        assert!(!metrics_path(&dir.0).exists());
+        assert!(!dir.0.join(".metrics").exists());
+    }
+
+    fn run_self_test(test_name: &str, envs: &[(&str, Option<&str>)]) {
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut cmd = Command::new(exe);
+        cmd.args(["--exact", test_name, "--nocapture"]);
+        cmd.env(SUBPROCESS_MARKER, "1");
+        for (key, value) in envs {
+            match value {
+                Some(v) => {
+                    cmd.env(key, v);
+                }
+                None => {
+                    cmd.env_remove(key);
+                }
+            }
+        }
+        let output = cmd.output().expect("spawn subprocess self-test");
+        assert!(
+            output.status.success(),
+            "subprocess test {test_name} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn options_default_and_help_include_no_metrics() {
+        assert!(!Options::default().no_metrics);
+        assert!(help_text().contains("--no-metrics"));
+
+        let parsed = parse_args(&["--no-metrics".to_string()]);
+        assert_eq!(parsed.action, "analyze");
+        assert!(parsed.no_metrics);
+
+        let help = parse_args(&["--help".to_string()]);
+        assert_eq!(help.action, "help");
+        assert!(!help.no_metrics);
+    }
+
+    #[test]
+    fn no_metrics_flag_skips_metrics_file_and_preserves_report_and_threshold() {
+        let dir = TestDir::new("flag");
+        create_branchy_fixture(&dir);
+        assert_no_metrics_behavior(&dir, &["--no-metrics"]);
+    }
+
+    #[test]
+    fn ub_tools_no_metrics_env_behaves_identically_in_subprocesses() {
+        if std::env::var_os(SUBPROCESS_MARKER).is_some() {
+            let expect_no_metrics = std::env::var(SUBPROCESS_EXPECT_ENV).as_deref() == Ok("1");
+            let parsed = parse_args(&[]);
+            assert_eq!(parsed.action, "analyze");
+            assert_eq!(parsed.no_metrics, expect_no_metrics);
+
+            let help = parse_args(&["--help".to_string()]);
+            assert_eq!(help.action, "help");
+            assert!(!help.no_metrics);
+
+            let dir = TestDir::new("env-subproc");
+            create_branchy_fixture(&dir);
+            if expect_no_metrics {
+                assert_no_metrics_behavior(&dir, &[]);
+            } else {
+                let (code, out, err) = run_fixture_cli(&dir, &[], "5.0");
+                assert_eq!(code, 2);
+                assert!(out.contains("CRAP Report"));
+                assert!(err.contains("Wrote "));
+                assert!(err.contains("CRAP threshold exceeded:"));
+                assert!(metrics_path(&dir.0).is_file());
+            }
+            return;
+        }
+
+        for (env_val, expect) in [
+            (None, "0"),
+            (Some("false"), "0"),
+            (Some("1"), "1"),
+            (Some("true"), "1"),
+        ] {
+            run_self_test(
+                "cli::tests::ub_tools_no_metrics_env_behaves_identically_in_subprocesses",
+                &[
+                    ("UB_TOOLS_NO_METRICS", env_val),
+                    (SUBPROCESS_EXPECT_ENV, Some(expect)),
+                ],
+            );
+        }
+    }
 }

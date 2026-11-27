@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/crapper", "crates/dryer", "crates/mutator"]
+members = ["crates/crapper", "crates/dryer", "crates/mutator", "crates/ub-runtime"]
 resolver = "3"
 
 [profile.release]

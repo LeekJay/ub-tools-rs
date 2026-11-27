@@ -1,6 +1,5 @@
 //! Text and EDN reports matching dry4clj and Python dryer's formatting.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -80,10 +79,7 @@ pub fn metrics_path(root: &Path) -> PathBuf {
 
 pub fn write_metrics(candidates: &[Duplicate], root: &Path) -> io::Result<PathBuf> {
     let path = metrics_path(root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, render_edn(candidates))?;
+    ub_runtime::atomic_write(&path, render_edn(candidates).as_bytes())?;
     Ok(path)
 }
 
@@ -126,5 +122,62 @@ mod tests {
         assert_eq!(edn_float(1.0), "1.0");
         assert_eq!(edn_float(0.0), "0.0");
         assert_eq!(edn_float(0.8909090909090909), "0.890909090909");
+    }
+
+    #[test]
+    fn write_metrics_leaves_valid_edn_and_no_tmp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dryer-report-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+
+        let candidate = Duplicate {
+            score: 0.9,
+            language: "rust".into(),
+            left: Span {
+                file: "src/a.rs".into(),
+                start_line: 1,
+                end_line: 5,
+            },
+            right: Span {
+                file: "src/b.rs".into(),
+                start_line: 10,
+                end_line: 14,
+            },
+            left_nodes: 22,
+            right_nodes: 22,
+        };
+
+        let first = write_metrics(std::slice::from_ref(&candidate), &dir).unwrap();
+        assert_eq!(first, metrics_path(&dir));
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            render_edn(std::slice::from_ref(&candidate))
+        );
+
+        let second = write_metrics(&[], &dir).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "{:candidates []}\n"
+        );
+
+        let entries: Vec<String> = std::fs::read_dir(dir.join(".metrics"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["dry.edn".to_string()]);
     }
 }

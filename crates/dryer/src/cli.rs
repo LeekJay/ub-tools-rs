@@ -50,6 +50,8 @@ Options:
   --format F                    text or edn, default text.
   --edn                         Same as --format edn.
   --text                        Same as --format text.
+  --no-metrics                  Skip writing .metrics/dry.edn.
+                                Print report only.
 
 Arguments:
   path              File or directory to compare. Test paths are included when
@@ -98,6 +100,7 @@ pub struct Options {
     pub min_nodes: usize,
     pub format: String,
     pub changed: bool,
+    pub no_metrics: bool,
 }
 
 impl Default for Options {
@@ -114,6 +117,7 @@ impl Default for Options {
             min_nodes: 20,
             format: "text".to_string(),
             changed: false,
+            no_metrics: false,
         }
     }
 }
@@ -233,6 +237,10 @@ pub fn parse_args(args: &[String]) -> Options {
                 options.changed = true;
                 Ok(1)
             }
+            "--no-metrics" => {
+                options.no_metrics = true;
+                Ok(1)
+            }
             _ if arg.starts_with('-') => Err(format!("Unknown option: {arg}")),
             _ => {
                 options.positionals.push(arg.clone());
@@ -259,6 +267,10 @@ pub fn parse_args(args: &[String]) -> Options {
             exit_code: 2,
             ..Options::default()
         };
+    }
+
+    if options.action == Action::Scan && ub_runtime::env_no_metrics() {
+        options.no_metrics = true;
     }
 
     options
@@ -438,6 +450,14 @@ pub fn select_files(options: &Options) -> Result<Vec<PathBuf>, GitStatusError> {
     Ok(unique.into_values().collect())
 }
 
+fn format_report(candidates: &[super::model::Duplicate], format: &str) -> String {
+    if format == "edn" {
+        render_edn(candidates)
+    } else {
+        format_text(candidates)
+    }
+}
+
 pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let options = parse_args(args);
     match options.action {
@@ -475,18 +495,20 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
         return 0;
     }
 
+    let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
+
     let (entries, warnings) = scan_files(&files, &root, options.min_lines, options.min_nodes);
     for warning in warnings {
         let _ = writeln!(err, "dryer: {warning}");
     }
     let candidates = find_duplicates(&entries, options.threshold);
+    if options.no_metrics {
+        let _ = write!(out, "{}", format_report(&candidates, &options.format));
+        return 0;
+    }
     match write_metrics(&candidates, &root) {
         Ok(metrics) => {
-            if options.format == "edn" {
-                let _ = write!(out, "{}", render_edn(&candidates));
-            } else {
-                let _ = write!(out, "{}", format_text(&candidates));
-            }
+            let _ = write!(out, "{}", format_report(&candidates, &options.format));
             let _ = writeln!(err, "Wrote {}", metrics.display());
             0
         }
@@ -688,5 +710,151 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn duplicate_clojure_fixture(label: &str) -> TempDirGuard {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("dryer-{label}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("left.cljc"),
+            "(ns sample.left)\n\n(defn alpha [xs]\n  (let [ys (filter odd? xs)]\n    (map inc ys)))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("right.cljc"),
+            "(ns sample.right)\n\n(defn beta [items]\n  (let [kept (filter even? items)]\n    (map dec kept)))\n",
+        )
+        .unwrap();
+        TempDirGuard(dir)
+    }
+
+    fn run_fixture_scan(dir: &Path, extra_args: &[&str]) -> (i32, String, String) {
+        let mut args = vec![
+            "--root".to_string(),
+            dir.to_str().unwrap().to_string(),
+            "--min-lines".to_string(),
+            "3".to_string(),
+            "--min-nodes".to_string(),
+            "8".to_string(),
+        ];
+        args.extend(extra_args.iter().map(|a| (*a).to_string()));
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_writers(&args, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn no_metrics_flag_skips_writing_metrics_for_text_and_edn() {
+        assert!(!Options::default().no_metrics);
+        assert!(help_text().contains("--no-metrics"));
+        assert!(parse_args(&s(&["--no-metrics"])).no_metrics);
+
+        let dir = duplicate_clojure_fixture("no-metrics-flag");
+        let metrics_file = dir.path().join(".metrics").join("dry.edn");
+
+        let (code, text_out, text_err) = run_fixture_scan(dir.path(), &["--no-metrics"]);
+        assert_eq!(code, 0);
+        assert!(text_out.contains("DUPLICATE score=1.00"));
+        assert!(text_out.contains("left.cljc:3-5"));
+        assert!(text_out.contains("right.cljc:3-5"));
+        assert!(!text_err.contains("Wrote "));
+        assert!(!metrics_file.exists());
+        assert!(!dir.path().join(".metrics").exists());
+
+        let (edn_code, edn_out, edn_err) = run_fixture_scan(dir.path(), &["--no-metrics", "--edn"]);
+        assert_eq!(edn_code, 0);
+        assert!(edn_out.contains("{:candidates ["));
+        assert!(edn_out.contains(":language \"clojure\""));
+        assert!(!edn_err.contains("Wrote "));
+        assert!(!metrics_file.exists());
+        assert!(!dir.path().join(".metrics").exists());
+    }
+
+    const SUBPROCESS_MARKER: &str = "DRYER_CLI_NO_METRICS_SUBPROC";
+    const SUBPROCESS_EXPECT_NO_METRICS: &str = "DRYER_CLI_EXPECT_NO_METRICS";
+
+    fn run_no_metrics_subproc_case(env_val: Option<&str>, expect_no_metrics: bool) {
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "--exact",
+            "cli::tests::env_ub_tools_no_metrics_skips_metrics_in_isolated_subprocess",
+            "--nocapture",
+        ]);
+        cmd.env(SUBPROCESS_MARKER, "1");
+        cmd.env(
+            SUBPROCESS_EXPECT_NO_METRICS,
+            if expect_no_metrics { "1" } else { "0" },
+        );
+        match env_val {
+            Some(v) => {
+                cmd.env("UB_TOOLS_NO_METRICS", v);
+            }
+            None => {
+                cmd.env_remove("UB_TOOLS_NO_METRICS");
+            }
+        }
+        let output = cmd.output().expect("spawn subprocess self-test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "subprocess test failed for UB_TOOLS_NO_METRICS={env_val:?}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn env_ub_tools_no_metrics_skips_metrics_in_isolated_subprocess() {
+        if std::env::var_os(SUBPROCESS_MARKER).is_some() {
+            let expect_no_metrics = std::env::var_os(SUBPROCESS_EXPECT_NO_METRICS).as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+            assert_eq!(parse_args(&[]).no_metrics, expect_no_metrics);
+            assert!(!parse_args(&s(&["--help"])).no_metrics);
+            assert!(!parse_args(&s(&["--format", "csv"])).no_metrics);
+
+            let dir = duplicate_clojure_fixture("env-subproc");
+            let (code, out_str, err_str) = run_fixture_scan(dir.path(), &[]);
+            assert_eq!(code, 0);
+            assert!(out_str.contains("DUPLICATE score=1.00"));
+            let metrics_file = dir.path().join(".metrics").join("dry.edn");
+            if expect_no_metrics {
+                assert!(!err_str.contains("Wrote "));
+                assert!(!metrics_file.exists());
+            } else {
+                assert!(err_str.contains("Wrote "));
+                assert!(metrics_file.is_file());
+            }
+            return;
+        }
+
+        run_no_metrics_subproc_case(Some("1"), true);
+        run_no_metrics_subproc_case(Some(" true "), true);
+        run_no_metrics_subproc_case(Some("0"), false);
+        run_no_metrics_subproc_case(None, false);
     }
 }

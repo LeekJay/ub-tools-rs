@@ -699,6 +699,15 @@ fn prepare_coverage<P: CliProvider>(
     if options.no_coverage || options.use_existing_coverage || options.scan {
         return 0;
     }
+    let _cov_lock = ub_runtime::acquire_repo_lock(
+        "coverage",
+        root,
+        Some(&format!(
+            "Waiting for another coverage run on {}...",
+            root.display()
+        )),
+    )
+    .ok();
     if let Some(cmd_str) = &options.coverage_command {
         use crate::runner::{Command, Runner};
         let result =
@@ -905,15 +914,23 @@ pub fn run_with<P: CliProvider + Sync>(args: &[String], provider: &P) -> i32 {
         println!("No source files to mutate.");
         return 0;
     }
-    if !options.scan {
-        restore(&root);
+    if options.scan {
+        let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
+        return scan(&options, &root, &files, provider);
     }
+    let _repo_lock = ub_runtime::acquire_repo_lock(
+        "mutator",
+        &root,
+        Some(&format!(
+            "Waiting for another mutator run on {}...",
+            root.display()
+        )),
+    )
+    .ok();
+    restore(&root);
     let coverage = prepare_coverage(&options, &root, &files, provider);
     if coverage != 0 {
         return coverage;
-    }
-    if options.scan {
-        return scan(&options, &root, &files, provider);
     }
     mutate_files(&options, &root, &files, provider)
 }
@@ -1022,5 +1039,134 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    struct CoverageLockTestProvider(std::sync::atomic::AtomicUsize);
+
+    impl DiscoverProvider for CoverageLockTestProvider {
+        fn language_of(&self, _path: &Path) -> Option<&'static str> {
+            Some("python")
+        }
+        fn is_test_filename(&self, _file_name: &str) -> bool {
+            false
+        }
+        fn skip_dirs(&self) -> &[&str] {
+            FALLBACK_SKIP_DIRS
+        }
+        fn test_dirs(&self) -> &[&str] {
+            FALLBACK_TEST_DIRS
+        }
+    }
+
+    impl EngineProvider for CoverageLockTestProvider {
+        fn sites_in_file(
+            &self,
+            _source: &str,
+            _path: &Path,
+            _root: &Path,
+            _file_key: &str,
+        ) -> Vec<crate::model::Site> {
+            Vec::new()
+        }
+        fn form_digests(
+            &self,
+            _source: &str,
+            _path: &Path,
+            _root: &Path,
+        ) -> std::collections::HashMap<(String, String), String> {
+            std::collections::HashMap::new()
+        }
+        fn form_spans(
+            &self,
+            _source: &str,
+            _path: &Path,
+            _root: &Path,
+        ) -> crate::engine::FormSpanMap {
+            std::collections::HashMap::new()
+        }
+        fn test_plan(
+            &self,
+            root: &Path,
+            _source: &Path,
+            _language: &str,
+            _override_cmd: Option<&str>,
+            _xcode_scheme: Option<&str>,
+            _xcode_destination: Option<&str>,
+        ) -> (crate::runner::Command, PathBuf) {
+            (
+                crate::runner::Command::Argv(vec!["true".into()]),
+                root.to_path_buf(),
+            )
+        }
+    }
+
+    impl CliProvider for CoverageLockTestProvider {
+        fn run_coverage(&self, _root: &Path, _files: &[PathBuf]) -> i32 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            0
+        }
+        fn covered_lines(
+            &self,
+            _root: &Path,
+            _path: &Path,
+            _language: &str,
+        ) -> Option<HashSet<usize>> {
+            None
+        }
+    }
+
+    #[test]
+    fn prepare_coverage_locks_only_when_generating_coverage() {
+        let root = std::env::temp_dir().join(format!("mutator_cov_lock_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let cov_guard = ub_runtime::acquire_repo_lock("coverage", &root, None).unwrap();
+        let provider = CoverageLockTestProvider(std::sync::atomic::AtomicUsize::new(0));
+
+        // Fast-path flags must not wait on the coverage lock or invoke run_coverage.
+        for opts in [
+            Options {
+                no_coverage: true,
+                ..Default::default()
+            },
+            Options {
+                use_existing_coverage: true,
+                ..Default::default()
+            },
+            Options {
+                scan: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(prepare_coverage(&opts, &root, &[], &provider), 0);
+        }
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        // Generating coverage must block on the repo coverage lock until released.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_bg = root.clone();
+        let handle = std::thread::spawn(move || {
+            let bg_provider = CoverageLockTestProvider(std::sync::atomic::AtomicUsize::new(0));
+            let code = prepare_coverage(&Options::default(), &root_bg, &[], &bg_provider);
+            tx.send((
+                code,
+                bg_provider.0.load(std::sync::atomic::Ordering::Acquire),
+            ))
+            .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(80))
+                .is_err(),
+            "prepare_coverage should block while coverage lock is held"
+        );
+        drop(cov_guard);
+        let (code, calls) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("prepare_coverage should complete after coverage lock drop");
+        assert_eq!(code, 0);
+        assert_eq!(calls, 1);
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

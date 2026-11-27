@@ -1,0 +1,22 @@
+[package]
+name = "ub-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+publish = false
+description = "Shared process priority, Rayon pooling, atomic I/O, and file lock helpers for ub-tools-rs"
+
+[dependencies]
+rayon = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lints.rust]
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"

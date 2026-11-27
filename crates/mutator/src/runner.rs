@@ -126,7 +126,7 @@ fn apply_process_group(cmd: &mut ProcessCommand) {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(ub_runtime::child_creation_flags(CREATE_NEW_PROCESS_GROUP));
     }
     #[cfg(unix)]
     {

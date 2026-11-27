@@ -13,6 +13,7 @@ Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's th
 * `crates/crapper` scores cyclomatic complexity and coverage into `.metrics/crap.edn` across Clojure, Java, Go, TypeScript, JavaScript, Vue SFC, Rust, Python, and Swift.
 * `crates/dryer` detects structural code duplicates via normalized AST fingerprints and Jaccard similarity into `.metrics/dry.edn`.
 * `crates/mutator` runs coverage-guided mutation testing across `.metrics/mutate/*.edn` snapshots and links `crapper` coverage and language discovery directly as a library crate (`crapper_lib`).
+* `crates/ub-runtime` provides shared OS process priority, thread caps, atomic `.edn` writes, and kernel file locks across the CLIs.
 
 ## Build and test
 
@@ -37,6 +38,25 @@ cargo install --path crates/mutator
 * Prefix-filtered Jaccard matching in `dryer` with compact integer token interning, frequency ordering, length-ratio bounds, and two-pointer early-exit intersection.
 * Zero-regex LCOV parsing plus basename-bucketed key indexing and `SKIP_DIRS` / `lcov-report` directory pruning in `crapper`.
 * Per-run coverage caching (`RwLock` + `NormalizedIndex`), single-pass `.metrics/mutate/*.edn` history indexing, and skipped SHA-256 form hashing when no prior history exists in `mutator`.
+
+## Multi-agent and anti-stutter safeguards
+
+All binaries initialize `ub-runtime` at startup so parallel agent runs stay responsive and avoid corrupting `.metrics/` files.
+
+* **Lowered OS priority** sets the process to `Below Normal` on Windows by default (`UB_TOOLS_PRIORITY`), and child test or coverage commands inherit that priority.
+* **Capped thread and worker pools** bound `rayon` to `min(6, cores/2)` (at least `1`) and `mutator` workers to `min(4, cores/4)` (at least `1`) unless overridden.
+* **Cross-process scan slots** limit concurrent `crapper`, `dryer`, and `mutator --scan` invocations to `2` global slots under `ub-tools-locks/` in the system temp directory.
+* **OS kernel file locks** under `ub-tools-locks/` in the system temp directory serialize per-repository coverage runs, `mutator` executions, and `.metrics/mutate/*.edn` updates while allowing shared history reads.
+* **Atomic `.edn` writes** stage metric output in unique sibling temp files, flush and close handles before renaming, and retry transient Windows sharing errors.
+* **Report-only mode** via `--no-metrics` (or `UB_TOOLS_NO_METRICS`) prints `crapper` and `dryer` reports and preserves threshold exit codes without touching `.metrics/`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `UB_TOOLS_PRIORITY` | `below_normal` | Set priority (`below_normal`, `low`, `idle`, or `normal`) for CLIs and children |
+| `UB_TOOLS_THREADS` | `min(6, cores/2)` | Override the `rayon` global thread pool size (falls back to `RAYON_NUM_THREADS` when unset) |
+| `UB_TOOLS_MUTATOR_WORKERS` | `min(4, cores/4)` | Override default `mutator` worker count when `--max-workers` is omitted |
+| `UB_TOOLS_MAX_CONCURRENT` | `2` | Set global scan lock slots across `crapper`, `dryer`, and `mutator --scan` (`0` disables) |
+| `UB_TOOLS_NO_METRICS` | unset | Skip writing `.metrics/crap.edn` and `.metrics/dry.edn` when set to `1`, `true`, or `yes` |
 
 ## Measured benchmarks
 

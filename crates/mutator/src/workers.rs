@@ -105,12 +105,19 @@ pub fn apply_site_bytes(
     Ok(updated)
 }
 
-/// Smaller of site count, available cores, and optional `--max-workers`, clamped to at least 1.
+/// Smaller of site count, available cores, and optional `--max-workers` (or default worker cap), clamped to at least 1.
 pub fn worker_count(site_count: usize, requested: Option<usize>) -> usize {
     let processors = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let limit = requested.unwrap_or(processors);
+    worker_count_for(site_count, processors, requested)
+}
+
+fn worker_count_for(site_count: usize, processors: usize, requested: Option<usize>) -> usize {
+    let limit = match requested {
+        Some(n) => n,
+        None => ub_runtime::default_mutator_workers(processors),
+    };
     1.max(site_count.min(processors).min(limit))
 }
 
@@ -827,5 +834,75 @@ mod tests {
         delete_tree(&base).unwrap();
         assert!(!base.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worker_count_caps_default_and_preserves_explicit_limit() {
+        let processors = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let default_limit = ub_runtime::default_mutator_workers(processors);
+        assert_eq!(
+            worker_count(1000, None),
+            1.max(processors.min(default_limit))
+        );
+        assert_eq!(worker_count(1, None), 1);
+        assert_eq!(worker_count(0, None), 1);
+        assert_eq!(worker_count(1000, Some(processors)), processors);
+        assert_eq!(worker_count(1000, Some(processors + 8)), processors);
+        assert_eq!(worker_count(1000, Some(2)), 1.max(processors.min(2)));
+        assert_eq!(worker_count(1000, Some(0)), 1);
+    }
+
+    #[test]
+    fn worker_count_for_caps_16_cores_and_honors_env_override_in_subprocess() {
+        const SUBPROC_ENV: &str = "MUTATOR_WORKERS_TEST_SUBPROC";
+        const MODE_ENV: &str = "MUTATOR_WORKERS_TEST_MODE";
+
+        if std::env::var_os(SUBPROC_ENV).is_some() {
+            match std::env::var(MODE_ENV).as_deref() {
+                Ok("default") => {
+                    assert_eq!(worker_count_for(100, 16, None), 4);
+                    assert_eq!(worker_count_for(2, 16, None), 2);
+                    assert_eq!(worker_count_for(0, 16, None), 1);
+                    assert_eq!(worker_count_for(100, 16, Some(12)), 12);
+                    assert_eq!(worker_count_for(100, 16, Some(32)), 16);
+                }
+                Ok("override") => {
+                    assert_eq!(worker_count_for(100, 16, None), 6);
+                    assert_eq!(worker_count_for(100, 16, Some(2)), 2);
+                    assert_eq!(worker_count_for(100, 16, Some(12)), 12);
+                }
+                other => panic!("unexpected mode: {other:?}"),
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current test exe");
+        for (mode, workers_env) in [("default", None), ("override", Some("6"))] {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "workers::tests::worker_count_for_caps_16_cores_and_honors_env_override_in_subprocess",
+                "--nocapture",
+            ])
+            .env(SUBPROC_ENV, "1")
+            .env(MODE_ENV, mode);
+            match workers_env {
+                Some(v) => {
+                    cmd.env("UB_TOOLS_MUTATOR_WORKERS", v);
+                }
+                None => {
+                    cmd.env_remove("UB_TOOLS_MUTATOR_WORKERS");
+                }
+            }
+            let out = cmd.output().expect("spawn worker_count subprocess");
+            assert!(
+                out.status.success(),
+                "subprocess mode {mode} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

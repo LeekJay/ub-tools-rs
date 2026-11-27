@@ -80,27 +80,35 @@ fn show_command(command: &ShellCommand) -> String {
 }
 
 fn build_command(program: &str, args: &[String], cwd: &Path) -> Command {
-    #[cfg(windows)]
-    {
-        // On Windows, `.cmd`/`.bat` shims (npm, npx, mvn, clj) cannot be spawned directly
-        // via CreateProcess without resolving or invoking through cmd.exe.
-        if let Some(resolved) = which_program(program) {
-            let ext = resolved
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_ascii_lowercase());
-            if matches!(ext.as_deref(), Some("cmd") | Some("bat")) {
-                let mut cmd = Command::new("cmd");
-                cmd.arg("/C").arg(&resolved).args(args).current_dir(cwd);
-                return cmd;
+    let mut cmd = {
+        #[cfg(windows)]
+        {
+            // On Windows, `.cmd`/`.bat` shims (npm, npx, mvn, clj) cannot be spawned directly
+            // via CreateProcess without resolving or invoking through cmd.exe.
+            match which_program(program) {
+                Some(resolved)
+                    if resolved
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|ext| {
+                            ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                        }) =>
+                {
+                    let mut c = Command::new("cmd");
+                    c.arg("/C").arg(&resolved);
+                    c
+                }
+                Some(resolved) => Command::new(resolved),
+                None => Command::new(program),
             }
-            let mut cmd = Command::new(resolved);
-            cmd.args(args).current_dir(cwd);
-            return cmd;
         }
-    }
-    let mut cmd = Command::new(program);
+        #[cfg(not(windows))]
+        {
+            Command::new(program)
+        }
+    };
     cmd.args(args).current_dir(cwd);
+    ub_runtime::apply_child_priority(&mut cmd);
     cmd
 }
 
@@ -145,20 +153,21 @@ pub fn run_shell(command: &ShellCommand, cwd: &Path) -> i32 {
     let status = match command {
         ShellCommand::Shell(text) => {
             #[cfg(windows)]
-            {
+            let mut cmd = {
                 let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-                Command::new(shell)
-                    .args(["/C", text])
-                    .current_dir(cwd)
-                    .status()
-            }
+                let mut c = Command::new(shell);
+                c.args(["/C", text]);
+                c
+            };
             #[cfg(not(windows))]
-            {
-                Command::new("/bin/sh")
-                    .args(["-c", text])
-                    .current_dir(cwd)
-                    .status()
-            }
+            let mut cmd = {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-c", text]);
+                c
+            };
+            cmd.current_dir(cwd);
+            ub_runtime::apply_child_priority(&mut cmd);
+            cmd.status()
         }
         ShellCommand::Args(args) => {
             let Some((program, rest)) = args.split_first() else {

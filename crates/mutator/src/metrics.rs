@@ -146,6 +146,7 @@ fn remember_outcomes(history: &mut History, data: &EdnValue, file_key: &str) {
 
 /// Prior form hashes and outcomes recorded for `file_key`.
 pub fn load_history(root: &Path, file_key: &str) -> History {
+    let _lock = ub_runtime::acquire_repo_shared_lock("mutate-metrics", root).ok();
     let mut history = History::default();
     for path in edn_files(root) {
         let Some(data) = read_edn_map(&path) else {
@@ -171,6 +172,7 @@ pub struct HistoryIndex {
 impl HistoryIndex {
     /// Load `.metrics/mutate/*.edn` once and bucket forms and outcomes by source `file_key`.
     pub fn load(root: &Path) -> Self {
+        let _lock = ub_runtime::acquire_repo_shared_lock("mutate-metrics", root).ok();
         let mut by_file: HashMap<String, History> = HashMap::new();
         for path in edn_files(root) {
             let Some(data) = read_edn_map(&path) else {
@@ -424,7 +426,7 @@ fn write_namespace(
     }
     let source = snapshot_source(fresh, &kept_forms, file_key);
     let content = render_snapshot(namespace, &source, rendered, merged);
-    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    ub_runtime::atomic_write(&path, content.as_bytes()).map_err(|e| e.to_string())?;
     Ok(Some(path))
 }
 
@@ -509,6 +511,8 @@ pub fn write_results(
             .push(form.clone());
     }
     let incoming_outcomes = file_outcomes(outcomes, file_key);
+    let _lock =
+        ub_runtime::acquire_repo_lock("mutate-metrics", &root, None).map_err(|e| e.to_string())?;
     let existing = read_snapshots(&root);
     let (mut retained, previous) = retain(&existing, file_key);
 
@@ -706,6 +710,218 @@ mod tests {
         )
         .unwrap();
         assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn collect_tmp_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_tmp_files(&path, out);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(".tmp"))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_write_results_preserve_both_files_and_leave_no_tmp() {
+        let root = temp_dir("concurrent");
+        let rounds = 12usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let root_a = root.clone();
+        let barrier_a = std::sync::Arc::clone(&barrier);
+        let thread_a = std::thread::spawn(move || {
+            let outcome_key = "[\"a.py\",\"demo\",\"defn/alpha\",2,10,\"+\",\"-\"]".to_string();
+            for round in 0..rounds {
+                barrier_a.wait();
+                let outcomes = HashMap::from([(outcome_key.clone(), "killed".to_string())]);
+                write_results(
+                    &root_a,
+                    "a.py",
+                    &[make_form(
+                        "demo",
+                        "alpha",
+                        "a.py",
+                        "hash-a",
+                        round + 1,
+                        false,
+                    )],
+                    &outcomes,
+                )
+                .expect("write_results a.py");
+            }
+        });
+
+        let root_b = root.clone();
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let thread_b = std::thread::spawn(move || {
+            let outcome_key = "[\"b.py\",\"demo\",\"defn/beta\",2,10,\"-\",\"+\"]".to_string();
+            for round in 0..rounds {
+                barrier_b.wait();
+                let outcomes = HashMap::from([(outcome_key.clone(), "survived".to_string())]);
+                write_results(
+                    &root_b,
+                    "b.py",
+                    &[make_form(
+                        "demo",
+                        "beta",
+                        "b.py",
+                        "hash-b",
+                        round + 1,
+                        false,
+                    )],
+                    &outcomes,
+                )
+                .expect("write_results b.py");
+            }
+        });
+
+        thread_a.join().expect("thread_a join");
+        thread_b.join().expect("thread_b join");
+
+        let path = snapshot_path(&root, "demo").unwrap();
+        let parsed = loads(&std::fs::read_to_string(&path).unwrap()).expect("valid shared EDN");
+        let forms = parsed.get("forms").and_then(EdnValue::as_vec).unwrap();
+        assert_eq!(forms.len(), 2, "expected both files' forms: {forms:?}");
+        let alpha = forms
+            .iter()
+            .find(|f| f.get("file").and_then(EdnValue::as_str) == Some("a.py"))
+            .expect("a.py form preserved");
+        let beta = forms
+            .iter()
+            .find(|f| f.get("file").and_then(EdnValue::as_str) == Some("b.py"))
+            .expect("b.py form preserved");
+        assert_eq!(
+            alpha.get("killed").and_then(EdnValue::as_i64),
+            Some(rounds as i64)
+        );
+        assert_eq!(
+            beta.get("killed").and_then(EdnValue::as_i64),
+            Some(rounds as i64)
+        );
+
+        let outcomes = outcomes_of(&parsed);
+        assert_eq!(
+            outcomes
+                .get("[\"a.py\",\"demo\",\"defn/alpha\",2,10,\"+\",\"-\"]")
+                .map(String::as_str),
+            Some("killed")
+        );
+        assert_eq!(
+            outcomes
+                .get("[\"b.py\",\"demo\",\"defn/beta\",2,10,\"-\",\"+\"]")
+                .map(String::as_str),
+            Some("survived")
+        );
+
+        let mut tmps = Vec::new();
+        collect_tmp_files(&root.join(".metrics").join("mutate"), &mut tmps);
+        assert!(tmps.is_empty(), "leftover tmp files: {tmps:?}");
+
+        // Also verify concurrent writes to distinct namespaces.
+        let barrier2 = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let root_c = root.clone();
+        let b_c = std::sync::Arc::clone(&barrier2);
+        let thread_c = std::thread::spawn(move || {
+            b_c.wait();
+            let key = "[\"c.py\",\"ns.one\",\"defn/gamma\",2,10,\"+\",\"-\"]".to_string();
+            let outcomes = HashMap::from([(key, "killed".to_string())]);
+            write_results(
+                &root_c,
+                "c.py",
+                &[make_form("ns.one", "gamma", "c.py", "hash-c", 3, false)],
+                &outcomes,
+            )
+            .expect("write_results c.py");
+        });
+        let root_d = root.clone();
+        let b_d = std::sync::Arc::clone(&barrier2);
+        let thread_d = std::thread::spawn(move || {
+            b_d.wait();
+            let key = "[\"d.py\",\"ns.two\",\"defn/delta\",2,10,\"-\",\"+\"]".to_string();
+            let outcomes = HashMap::from([(key, "survived".to_string())]);
+            write_results(
+                &root_d,
+                "d.py",
+                &[make_form("ns.two", "delta", "d.py", "hash-d", 5, false)],
+                &outcomes,
+            )
+            .expect("write_results d.py");
+        });
+        thread_c.join().expect("thread_c join");
+        thread_d.join().expect("thread_d join");
+
+        let index = HistoryIndex::load(&root);
+        assert!(index.get("c.py").is_some());
+        assert!(index.get("d.py").is_some());
+        collect_tmp_files(&root.join(".metrics").join("mutate"), &mut tmps);
+        assert!(tmps.is_empty(), "leftover tmp files: {tmps:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_namespace_write_cleans_up_temp_files() {
+        let root = temp_dir("atomic");
+        let outcome = "[\"a.py\",\"pkg.demo\",\"defn/run\",2,10,\"+\",\"-\"]".to_string();
+        let outcomes = HashMap::from([(outcome.clone(), "killed".to_string())]);
+        let path = write_namespace(
+            &root,
+            "pkg.demo",
+            Vec::new(),
+            HashMap::new(),
+            &[make_form("pkg.demo", "run", "a.py", "h1", 1, false)],
+            &outcomes,
+            "a.py",
+        )
+        .expect("initial write_namespace")
+        .expect("path returned");
+        assert!(path.is_file());
+        let parsed = loads(&std::fs::read_to_string(&path).unwrap()).expect("valid EDN");
+        assert_eq!(
+            parsed.get("namespace").and_then(EdnValue::as_str),
+            Some("pkg.demo")
+        );
+
+        write_namespace(
+            &root,
+            "pkg.demo",
+            Vec::new(),
+            HashMap::new(),
+            &[make_form("pkg.demo", "run", "a.py", "h2", 2, false)],
+            &outcomes,
+            "a.py",
+        )
+        .expect("overwrite write_namespace");
+        let mut tmps = Vec::new();
+        collect_tmp_files(&root.join(".metrics").join("mutate"), &mut tmps);
+        assert!(tmps.is_empty(), "leftover tmp files on overwrite: {tmps:?}");
+
+        // Force atomic_write failure by occupying the target path with a non-empty directory.
+        let blocked_path = snapshot_path(&root, "blocked").unwrap();
+        std::fs::create_dir_all(blocked_path.join("inner")).unwrap();
+        let err = write_namespace(
+            &root,
+            "blocked",
+            Vec::new(),
+            HashMap::new(),
+            &[make_form("blocked", "fail", "b.py", "h3", 1, false)],
+            &HashMap::new(),
+            "b.py",
+        )
+        .expect_err("write_namespace over directory must fail");
+        assert!(!err.is_empty());
+
+        collect_tmp_files(&root.join(".metrics").join("mutate"), &mut tmps);
+        assert!(tmps.is_empty(), "leftover tmp files after error: {tmps:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
