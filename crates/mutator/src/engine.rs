@@ -8,7 +8,7 @@ use crate::model::{FormResult, History, RunResult, ScanFileData, Site};
 use crate::path_util::{resolve_path, to_posix};
 use crate::report::format_scan;
 use crate::runner::{Command, Runner, display_command};
-use crate::workers::{MutantRunConfig, run_mutants};
+use crate::workers::{MutantRunConfig, WorkerContext, run_mutants, run_mutants_with_context};
 
 /// Cached baseline key `(command_identity, working_directory_string)`.
 pub type BaselineKey = (Vec<String>, String);
@@ -436,6 +436,32 @@ pub fn mutate_file_cached_with_history<R: Runner + Sync, E: EngineProvider>(
         baselines,
         Some(history),
         cached_sites,
+        None,
+        provider,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mutate_file_cached_with_context<R: Runner + Sync, E: EngineProvider>(
+    path: &Path,
+    root: &Path,
+    runner: &R,
+    opts: &MutateOptions<'_>,
+    baselines: &mut BaselineCache,
+    history: &History,
+    cached_sites: Option<&[Site]>,
+    ctx: &mut WorkerContext,
+    provider: &E,
+) -> RunResult {
+    mutate_file_impl(
+        path,
+        root,
+        runner,
+        opts,
+        baselines,
+        Some(history),
+        cached_sites,
+        Some(ctx),
         provider,
     )
 }
@@ -459,6 +485,7 @@ pub fn mutate_file_with_history<R: Runner + Sync, E: EngineProvider>(
         baselines,
         Some(history),
         None,
+        None,
         provider,
     )
 }
@@ -472,7 +499,9 @@ pub fn mutate_file_with<R: Runner + Sync, E: EngineProvider>(
     baselines: &mut BaselineCache,
     provider: &E,
 ) -> RunResult {
-    mutate_file_impl(path, root, runner, opts, baselines, None, None, provider)
+    mutate_file_impl(
+        path, root, runner, opts, baselines, None, None, None, provider,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,6 +513,7 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
     baselines: &mut BaselineCache,
     preloaded_history: Option<&History>,
     cached_sites: Option<&[Site]>,
+    worker_ctx: Option<&mut WorkerContext>,
     provider: &E,
 ) -> RunResult {
     let root = resolve_path(root);
@@ -565,14 +595,26 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
             timeout,
             file_key: &file_key,
         };
-        if let Err(err) = run_mutants(
-            &path,
-            &selected,
-            opts.max_workers,
-            runner,
-            &run_cfg,
-            &mut outcomes,
-        ) {
+        let run_result = match worker_ctx {
+            Some(ctx) => run_mutants_with_context(
+                &path,
+                &selected,
+                opts.max_workers,
+                runner,
+                &run_cfg,
+                &mut outcomes,
+                ctx,
+            ),
+            None => run_mutants(
+                &path,
+                &selected,
+                opts.max_workers,
+                runner,
+                &run_cfg,
+                &mut outcomes,
+            ),
+        };
+        if let Err(err) = run_result {
             return RunResult {
                 path: file_key,
                 baseline_failed: true,

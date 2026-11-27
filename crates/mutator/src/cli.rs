@@ -13,7 +13,7 @@ use ub_runtime::{FileStamp, ManifestStampCache};
 
 use crate::cache::{CachedSites, SiteCache, file_stamp, repo_cache_path};
 use crate::engine::{
-    BaselineCache, EngineProvider, MutateOptions, ScanOptions, mutate_file_cached_with_history,
+    BaselineCache, EngineProvider, MutateOptions, ScanOptions, mutate_file_cached_with_context,
     restore_backups, scan_file_cached_with_history, scan_file_resolved_with_history,
 };
 use crate::metrics::{HistoryIndex, source_key_resolved};
@@ -25,6 +25,7 @@ use crate::report::{
 };
 use crate::runner::CommandRunner;
 use crate::sources::{DiscoverProvider, is_mutable_source, is_skipped_test, iter_source_files};
+use crate::workers::WorkerContext;
 
 pub fn comma_and(names: &[&str]) -> String {
     let mut ordered: Vec<&str> = names.to_vec();
@@ -1023,6 +1024,7 @@ fn mutate_files<P: CliProvider + Sync>(
     let mut baselines = BaselineCache::new();
     let history_index = HistoryIndex::load(root);
     let empty_history = History::default();
+    let mut worker_ctx = WorkerContext::new();
     let mut acc = MutateAccumulator::default();
     let mut misses = Vec::new();
     let mut active_keys = HashSet::with_capacity(files.len());
@@ -1048,7 +1050,7 @@ fn mutate_files<P: CliProvider + Sync>(
                 .as_deref()
                 .and_then(|key| history_index.get(key))
                 .unwrap_or(&empty_history);
-            let result = mutate_file_cached_with_history(
+            let result = mutate_file_cached_with_context(
                 path,
                 root,
                 &runner,
@@ -1056,6 +1058,7 @@ fn mutate_files<P: CliProvider + Sync>(
                 &mut baselines,
                 history,
                 lookup.cached_sites,
+                &mut worker_ctx,
                 provider,
             );
             (

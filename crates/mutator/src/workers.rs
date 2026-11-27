@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use rayon::prelude::*;
 use regex::Regex;
 
 use crate::model::Site;
@@ -66,7 +67,7 @@ pub const CONFIGS: &[&str] = &[
 const JS_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
 
 static SPECIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:from|import|require)\s*\(?\s*['"](\.[^'"]+)['"]"#).expect("valid regex")
+    Regex::new(r#"(?:from|import|require)\s*\(?\s*['"](\.[^'"]*)['"]"#).expect("valid regex")
 });
 
 /// Replace UTF-8 byte slice `start..end` in `source` with `mutant`.
@@ -170,27 +171,41 @@ fn remove_link_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Create a symlink from `link` to resolved `target`, replacing any existing link/file at `link`.
-pub fn symlink(link: &Path, target: &Path) -> std::io::Result<()> {
-    if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if std::fs::symlink_metadata(link).is_ok() {
-        remove_link_entry(link)?;
-    }
-    let resolved = resolve_path(target);
+fn create_os_symlink(link: &Path, resolved_target: &Path, is_dir: bool) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&resolved, link)
+        let _ = is_dir;
+        std::os::unix::fs::symlink(resolved_target, link)
     }
     #[cfg(windows)]
     {
-        if resolved.is_dir() {
-            std::os::windows::fs::symlink_dir(&resolved, link)
+        if is_dir {
+            std::os::windows::fs::symlink_dir(resolved_target, link)
         } else {
-            std::os::windows::fs::symlink_file(&resolved, link)
+            std::os::windows::fs::symlink_file(resolved_target, link)
         }
     }
+}
+
+fn symlink_known(
+    link: &Path,
+    resolved_target: &Path,
+    is_dir: bool,
+    check_existing: bool,
+) -> std::io::Result<()> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if check_existing && std::fs::symlink_metadata(link).is_ok() {
+        remove_link_entry(link)?;
+    }
+    create_os_symlink(link, resolved_target, is_dir)
+}
+
+/// Create a symlink from `link` to resolved `target`, replacing any existing link/file at `link`.
+pub fn symlink(link: &Path, target: &Path) -> std::io::Result<()> {
+    let resolved = resolve_path(target);
+    symlink_known(link, &resolved, resolved.is_dir(), true)
 }
 
 /// Remove a worker tree without following symlinks into the real project.
@@ -221,7 +236,7 @@ where
     }
 }
 
-fn delete_once(path: &Path) -> std::io::Result<()> {
+fn delete_once_seq(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
@@ -233,7 +248,7 @@ fn delete_once(path: &Path) -> std::io::Result<()> {
     if meta.is_dir() {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            delete_once(&entry.path())?;
+            delete_once_seq(&entry.path())?;
         }
         return std::fs::remove_dir(path);
     }
@@ -243,13 +258,48 @@ fn delete_once(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn copy_configs(worker: &Path, root: &Path, relative: &str) -> std::io::Result<()> {
+fn delete_once(path: &Path) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return remove_link_entry(path);
+    }
+    if meta.is_dir() {
+        let entries: Vec<PathBuf> = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|item| item.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if entries.len() > 1 {
+            entries.par_iter().try_for_each(|p| delete_once_seq(p))?;
+        } else {
+            for child in &entries {
+                delete_once_seq(child)?;
+            }
+        }
+        return std::fs::remove_dir(path);
+    }
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn read_configs(root: &Path, relative: &str) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut configs = Vec::new();
     for &name in CONFIGS {
         let source = root.join(name);
         if !source.is_file() || name == relative {
             continue;
         }
-        let bytes = std::fs::read(&source)?;
+        configs.push((name.to_string(), std::fs::read(&source)?));
+    }
+    Ok(configs)
+}
+
+fn write_configs(worker: &Path, configs: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    for (name, bytes) in configs {
         std::fs::write(worker.join(name), bytes)?;
     }
     Ok(())
@@ -284,6 +334,7 @@ fn link_children(worker_dir: &Path, real_dir: &Path, skip: &HashSet<&str>) -> st
     if !real_dir.is_dir() {
         return Ok(());
     }
+    std::fs::create_dir_all(worker_dir)?;
     for entry in std::fs::read_dir(real_dir)? {
         let entry = entry?;
         let child_name = entry.file_name();
@@ -300,7 +351,12 @@ fn link_children(worker_dir: &Path, real_dir: &Path, skip: &HashSet<&str>) -> st
             copy_bundle(&child, &destination)?;
             continue;
         }
-        symlink(&destination, &child)?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            symlink(&destination, &child)?;
+        } else {
+            create_os_symlink(&destination, &child, ft.is_dir())?;
+        }
     }
     Ok(())
 }
@@ -323,109 +379,246 @@ fn has_js_extension(path: &Path) -> bool {
     JS_EXTENSIONS.iter().any(|ext| text.ends_with(ext))
 }
 
-fn strip_js_extension(base: &Path) -> PathBuf {
-    let text = base.to_string_lossy();
+fn strip_js_extension_str(path: &str) -> &str {
     for ext in JS_EXTENSIONS {
-        if let Some(stem) = text.strip_suffix(ext) {
-            return PathBuf::from(stem);
+        if let Some(stem) = path.strip_suffix(ext) {
+            return stem;
         }
     }
-    base.to_path_buf()
+    path
 }
 
-fn candidates(directory: &Path, specifier: &str) -> Vec<PathBuf> {
-    let base = directory.join(specifier);
-    let stem = strip_js_extension(&base);
-    let stem_text = stem.to_string_lossy();
-    let mut names = vec![base];
-    for ext in JS_EXTENSIONS {
-        names.push(PathBuf::from(format!("{stem_text}{ext}")));
+fn lookup_key(rel: &str) -> String {
+    #[cfg(windows)]
+    {
+        rel.to_lowercase()
     }
-    for ext in JS_EXTENSIONS {
-        names.push(stem.join(format!("index{ext}")));
+    #[cfg(not(windows))]
+    {
+        rel.to_string()
     }
-    names
 }
 
-fn inside(root: &Path, path: &Path) -> Option<PathBuf> {
-    let resolved_root = resolve_path(root);
-    let resolved_path = resolve_path(path);
-    let rel = resolved_path.strip_prefix(&resolved_root).ok()?;
-    Some(root.join(rel))
-}
-
-fn imported_files(importer: &Path, root: &Path) -> HashSet<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(importer) else {
-        return HashSet::new();
+fn resolve_relative_posix(parent_rel: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if parent_rel.is_empty() {
+        Vec::new()
+    } else {
+        parent_rel.split('/').filter(|s| !s.is_empty()).collect()
     };
-    let parent = importer.parent().unwrap_or(root);
+    for seg in spec.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn collect_js_sources_fast(root_resolved: &Path) -> Vec<(PathBuf, String)> {
+    fn push_if_under(path: PathBuf, root_resolved: &Path, out: &mut Vec<(PathBuf, String)>) {
+        if let Some(rel) = path.strip_prefix(root_resolved).ok().map(to_posix) {
+            out.push((path, rel));
+        }
+    }
+    fn walk(dir: &Path, root_resolved: &Path, in_symlink: bool, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if ft.is_dir() {
+                if !is_skip_link(&name_str) && name_str != "node_modules" {
+                    walk(&path, root_resolved, in_symlink, out);
+                }
+            } else if ft.is_symlink() {
+                if path.is_dir() {
+                    if !is_skip_link(&name_str) && name_str != "node_modules" {
+                        walk(&path, root_resolved, true, out);
+                    }
+                } else if path.is_file() && has_js_extension(&path) {
+                    push_if_under(resolve_path(&path), root_resolved, out);
+                }
+            } else if ft.is_file() && has_js_extension(&path) {
+                let target = if in_symlink {
+                    resolve_path(&path)
+                } else {
+                    path
+                };
+                push_if_under(target, root_resolved, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root_resolved, root_resolved, false, &mut out);
+    out
+}
+
+fn imported_rel_paths(
+    source_rel: &str,
+    text: &str,
+    known: &HashMap<String, String>,
+) -> HashSet<String> {
+    if !text.contains("import") && !text.contains("from") && !text.contains("require") {
+        return HashSet::new();
+    }
+    let parent_rel = match source_rel.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
     let mut found = HashSet::new();
-    for spec in specifiers(&text) {
-        for cand in candidates(parent, &spec) {
-            if let Some(local) = inside(root, &cand)
-                && local.is_file()
-            {
-                found.insert(resolve_path(&local));
+    for spec in specifiers(text) {
+        let Some(norm) = resolve_relative_posix(parent_rel, &spec) else {
+            continue;
+        };
+        if !norm.is_empty()
+            && let Some(canonical) = known.get(&lookup_key(&norm))
+        {
+            found.insert(canonical.clone());
+        }
+        let stem = strip_js_extension_str(&norm);
+        if !stem.is_empty() {
+            for ext in JS_EXTENSIONS {
+                let cand = format!("{stem}{ext}");
+                if let Some(canonical) = known.get(&lookup_key(&cand)) {
+                    found.insert(canonical.clone());
+                }
+            }
+        }
+        for ext in JS_EXTENSIONS {
+            let cand = if stem.is_empty() {
+                format!("index{ext}")
+            } else {
+                format!("{stem}/index{ext}")
+            };
+            if let Some(canonical) = known.get(&lookup_key(&cand)) {
+                found.insert(canonical.clone());
             }
         }
     }
     found
 }
 
-fn collect_js_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if path.is_dir() {
-            if !is_skip_link(&name_str) && name_str != "node_modules" {
-                collect_js_sources(&path, out);
-            }
-        } else if has_js_extension(&path) {
-            out.push(path);
+/// Reusable in-memory reverse dependency graph for JS/TS relative imports.
+#[derive(Debug, Default, Clone)]
+pub struct ImportGraph {
+    canonical: HashMap<String, String>,
+    reverse: HashMap<String, Vec<String>>,
+}
+
+impl ImportGraph {
+    /// Build a reverse-import graph across all JS/TS modules under `root` in parallel.
+    pub fn build(root: &Path) -> Self {
+        let root_resolved = resolve_path(root);
+        let sources = collect_js_sources_fast(&root_resolved);
+        let mut canonical = HashMap::with_capacity(sources.len());
+        for (_, rel) in &sources {
+            canonical.insert(lookup_key(rel), rel.clone());
         }
+
+        let edges: Vec<(String, HashSet<String>)> = sources
+            .par_iter()
+            .filter_map(|(path, rel)| {
+                let text = std::fs::read_to_string(path).ok()?;
+                let imported = imported_rel_paths(rel, &text, &canonical);
+                if imported.is_empty() {
+                    None
+                } else {
+                    Some((rel.clone(), imported))
+                }
+            })
+            .collect();
+
+        let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+        for (importer, targets) in edges {
+            for target in targets {
+                reverse.entry(target).or_default().push(importer.clone());
+            }
+        }
+        Self { canonical, reverse }
+    }
+
+    /// Return relative POSIX paths of all JS/TS modules that transitively import `relative`.
+    pub fn importers_of(&self, relative: &str) -> HashSet<String> {
+        let normalized = relative.replace('\\', "/");
+        let trimmed = normalized.strip_prefix("./").unwrap_or(&normalized);
+        if !has_js_extension(Path::new(trimmed)) {
+            return HashSet::new();
+        }
+        let target = self
+            .canonical
+            .get(&lookup_key(trimmed))
+            .map(String::as_str)
+            .unwrap_or(trimmed);
+
+        let mut found: HashSet<String> = HashSet::new();
+        let mut pending: Vec<&str> = vec![target];
+        while let Some(current) = pending.pop() {
+            let Some(importers) = self.reverse.get(current) else {
+                continue;
+            };
+            for importer in importers {
+                if importer == target || found.contains(importer.as_str()) {
+                    continue;
+                }
+                found.insert(importer.clone());
+                pending.push(importer.as_str());
+            }
+        }
+        found
+    }
+}
+
+/// Per-run worker state caching the repository's `ImportGraph` across mutated files.
+#[derive(Debug, Default)]
+pub struct WorkerContext {
+    cached: Option<(PathBuf, ImportGraph)>,
+}
+
+impl WorkerContext {
+    /// Create an empty worker context.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up transitive JS/TS importers for `relative` under `root`, caching the graph per root.
+    pub fn importers_of(&mut self, root: &Path, relative: &str) -> HashSet<String> {
+        if !has_js_extension(Path::new(relative)) {
+            return HashSet::new();
+        }
+        let root_resolved = if self.cached.as_ref().is_some_and(|(r, _)| r == root) {
+            root.to_path_buf()
+        } else {
+            resolve_path(root)
+        };
+        let needs_build = !self
+            .cached
+            .as_ref()
+            .is_some_and(|(r, _)| r == &root_resolved);
+        if needs_build {
+            let graph = ImportGraph::build(&root_resolved);
+            self.cached = Some((root_resolved, graph));
+        }
+        self.cached
+            .as_ref()
+            .map(|(_, graph)| graph.importers_of(relative))
+            .unwrap_or_default()
     }
 }
 
 /// Relative POSIX paths of JS/TS modules that reach `relative` via relative imports.
 pub fn importers_of(root: &Path, relative: &str) -> HashSet<String> {
-    let target = resolve_path(&root.join(relative));
-    let mut sources = Vec::new();
-    collect_js_sources(root, &mut sources);
-
-    let mut reverse: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
-    for source in sources {
-        let source_resolved = resolve_path(&source);
-        for imported in imported_files(&source, root) {
-            reverse
-                .entry(imported)
-                .or_default()
-                .insert(source_resolved.clone());
-        }
+    if !has_js_extension(Path::new(relative)) {
+        return HashSet::new();
     }
-
-    let mut found: HashSet<PathBuf> = HashSet::new();
-    let mut pending = vec![target.clone()];
-    while let Some(current) = pending.pop() {
-        if let Some(importers) = reverse.get(&current) {
-            for importer in importers {
-                if found.contains(importer) || importer == &target {
-                    continue;
-                }
-                found.insert(importer.clone());
-                pending.push(importer.clone());
-            }
-        }
-    }
-
-    let root_resolved = resolve_path(root);
-    found
-        .into_iter()
-        .filter_map(|p| p.strip_prefix(&root_resolved).ok().map(to_posix))
-        .collect()
+    ImportGraph::build(root).importers_of(relative)
 }
 
 fn expand_directory(link: &Path, real_dir: &Path) -> std::io::Result<()> {
@@ -440,12 +633,19 @@ fn expand_directory(link: &Path, real_dir: &Path) -> std::io::Result<()> {
         if is_skip_link(&name.to_string_lossy()) {
             continue;
         }
-        symlink(&link.join(name), &entry.path())?;
+        let child = entry.path();
+        let dest = link.join(name);
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            symlink(&dest, &child)?;
+        } else {
+            create_os_symlink(&dest, &child, ft.is_dir())?;
+        }
     }
     Ok(())
 }
 
-fn copy_importer(worker: &Path, root: &Path, relative: &str) -> std::io::Result<()> {
+fn write_importer(worker: &Path, relative: &str, bytes: &[u8], root: &Path) -> std::io::Result<()> {
     let mut real = root.to_path_buf();
     let mut current = worker.to_path_buf();
     let segments: Vec<&str> = relative.split('/').collect();
@@ -471,7 +671,6 @@ fn copy_importer(worker: &Path, root: &Path, relative: &str) -> std::io::Result<
     } else if destination.exists() {
         return Ok(());
     }
-    let bytes = std::fs::read(root.join(relative))?;
     std::fs::write(destination, bytes)
 }
 
@@ -496,6 +695,41 @@ fn overlay(worker: &Path, root: &Path, relative: &str, original: &[u8]) -> std::
     std::fs::write(destination, original)
 }
 
+fn create_workers_with_importers(
+    base: &Path,
+    root_resolved: &Path,
+    relative: &str,
+    original: &[u8],
+    count: usize,
+    importers: &HashSet<String>,
+) -> std::io::Result<Vec<PathBuf>> {
+    let first = relative.split('/').next().unwrap_or(relative);
+    let configs = read_configs(root_resolved, relative)?;
+    let mut sorted_importers: Vec<&str> = importers.iter().map(String::as_str).collect();
+    sorted_importers.sort_unstable();
+    let importer_bytes: Vec<(&str, Vec<u8>)> = sorted_importers
+        .par_iter()
+        .map(|&rel| std::fs::read(root_resolved.join(rel)).map(|bytes| (rel, bytes)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    (0..count)
+        .into_par_iter()
+        .map(|index| {
+            let worker = base.join(format!("worker-{index}"));
+            std::fs::create_dir_all(&worker)?;
+            write_configs(&worker, &configs)?;
+            let mut top_skip = HashSet::new();
+            top_skip.insert(first);
+            link_children(&worker, root_resolved, &top_skip)?;
+            overlay(&worker, root_resolved, relative, original)?;
+            for (importer, bytes) in &importer_bytes {
+                write_importer(&worker, importer, bytes, root_resolved)?;
+            }
+            Ok(worker)
+        })
+        .collect()
+}
+
 /// Create `count` parallel worker overlay directories under `base`.
 pub fn create_workers(
     base: &Path,
@@ -504,23 +738,9 @@ pub fn create_workers(
     original: &[u8],
     count: usize,
 ) -> std::io::Result<Vec<PathBuf>> {
-    let mut created = Vec::with_capacity(count);
-    let first = relative.split('/').next().unwrap_or(relative);
-    let importers = importers_of(root, relative);
-    for index in 0..count {
-        let worker = base.join(format!("worker-{index}"));
-        std::fs::create_dir_all(&worker)?;
-        copy_configs(&worker, root, relative)?;
-        let mut top_skip = HashSet::new();
-        top_skip.insert(first);
-        link_children(&worker, root, &top_skip)?;
-        overlay(&worker, root, relative, original)?;
-        for importer in &importers {
-            copy_importer(&worker, root, importer)?;
-        }
-        created.push(worker);
-    }
-    Ok(created)
+    let root_resolved = resolve_path(root);
+    let importers = importers_of(&root_resolved, relative);
+    create_workers_with_importers(base, &root_resolved, relative, original, count, &importers)
 }
 
 /// Map a real-tree `cwd` into the equivalent path inside `worker`.
@@ -616,25 +836,35 @@ impl Drop for RunDirCleanup<'_> {
     }
 }
 
-/// Mutate `sites` in parallel overlays of `root`, storing statuses in `outcomes`.
-pub fn run_mutants<R: Runner + Sync>(
+/// Mutate `sites` in parallel overlays of `root`, reusing `ctx`'s cached import graph across files.
+pub(crate) fn run_mutants_with_context<R: Runner + Sync>(
     source: &Path,
     sites: &[Site],
     max_workers: Option<usize>,
     runner: &R,
     cfg: &MutantRunConfig<'_>,
     outcomes: &mut HashMap<String, String>,
+    ctx: &mut WorkerContext,
 ) -> std::io::Result<()> {
     if sites.is_empty() {
         return Ok(());
     }
-    let base = new_run_dir(cfg.root)?;
+    let root_resolved = resolve_path(cfg.root);
+    let base = new_run_dir(&root_resolved)?;
     let mut cleanup = RunDirCleanup(Some(&base));
 
-    let relative = relative_posix(source, cfg.root)
+    let relative = relative_posix(source, &root_resolved)
         .ok_or_else(|| std::io::Error::other("source is outside project root"))?;
+    let importers = ctx.importers_of(&root_resolved, &relative);
     let count = worker_count(sites.len(), max_workers);
-    let directories = create_workers(&base, cfg.root, &relative, cfg.original, count)?;
+    let directories = create_workers_with_importers(
+        &base,
+        &root_resolved,
+        &relative,
+        cfg.original,
+        count,
+        &importers,
+    )?;
 
     let queue: Mutex<VecDeque<&Site>> = Mutex::new(sites.iter().collect());
     let results: Mutex<Vec<(String, String)>> = Mutex::new(Vec::with_capacity(sites.len()));
@@ -671,6 +901,19 @@ pub fn run_mutants<R: Runner + Sync>(
     delete_tree(&base)?;
     prune_empty_run_parents(&base);
     Ok(())
+}
+
+/// Mutate `sites` in parallel overlays of `root`, storing statuses in `outcomes`.
+pub fn run_mutants<R: Runner + Sync>(
+    source: &Path,
+    sites: &[Site],
+    max_workers: Option<usize>,
+    runner: &R,
+    cfg: &MutantRunConfig<'_>,
+    outcomes: &mut HashMap<String, String>,
+) -> std::io::Result<()> {
+    let mut ctx = WorkerContext::new();
+    run_mutants_with_context(source, sites, max_workers, runner, cfg, outcomes, &mut ctx)
 }
 
 #[cfg(test)]
@@ -831,6 +1074,108 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        delete_tree(&base).unwrap();
+        assert!(!base.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_graph_and_worker_context_handle_transitive_esm_index_escaping_and_reuse() {
+        let root = temp_dir("import_graph");
+        std::fs::create_dir_all(root.join("src").join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("outside_sibling")).unwrap();
+        std::fs::write(root.join("index.ts"), "export const rootIdx = 1;\n").unwrap();
+        std::fs::write(root.join("src").join("a.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(
+            root.join("src").join("b.ts"),
+            "import { a } from './a.js';\nexport const b = a + 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("sub").join("index.ts"),
+            "import { b } from '../b';\nexport const sub = b;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("sub").join("leaf.ts"),
+            "import { sub } from '.';\nimport { rootIdx } from '../..';\nimport { gone } from '../../../outside.ts';\nexport const leaf = [sub, rootIdx, gone];\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("app.py"), "def f(x):\n    return x\n").unwrap();
+
+        let graph = ImportGraph::build(&root);
+        let a_importers = graph.importers_of("src/a.ts");
+        assert_eq!(
+            a_importers,
+            HashSet::from([
+                "src/b.ts".to_string(),
+                "src/sub/index.ts".to_string(),
+                "src/sub/leaf.ts".to_string(),
+            ])
+        );
+        assert_eq!(
+            graph.importers_of("index.ts"),
+            HashSet::from(["src/sub/leaf.ts".to_string()])
+        );
+        assert!(graph.importers_of("src/app.py").is_empty());
+
+        let mut ctx = WorkerContext::new();
+        // Non-JS target stays lazy (no graph built).
+        assert!(ctx.importers_of(&root, "src/app.py").is_empty());
+        assert!(ctx.cached.is_none());
+
+        // First JS target builds and caches graph under resolved root.
+        assert_eq!(ctx.importers_of(&root, "src/a.ts"), a_importers);
+        assert!(ctx.cached.is_some());
+
+        // Delete a.ts-unrelated edge on disk? Reuse proves cached graph returns prior state without rescanning.
+        std::fs::remove_file(root.join("src").join("sub").join("leaf.ts")).unwrap();
+        assert_eq!(ctx.importers_of(&root, "src/a.ts"), a_importers);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parallel_create_workers_creates_four_isolated_overlays_and_cleans_up() {
+        let root = temp_dir("parallel_workers");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("package.json"), "{\"name\":\"demo\"}\n").unwrap();
+        let target = root.join("src").join("calc.ts");
+        std::fs::write(&target, "export const v = 1;\n").unwrap();
+        std::fs::write(
+            root.join("src").join("calc.test.ts"),
+            "import { v } from './calc';\nexport const t = v;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("other.ts"), "export const o = 2;\n").unwrap();
+
+        let base = new_run_dir(&root).unwrap();
+        let original = std::fs::read(&target).unwrap();
+        let workers = create_workers(&base, &root, "src/calc.ts", &original, 4).unwrap();
+        assert_eq!(workers.len(), 4);
+        for (idx, w) in workers.iter().enumerate() {
+            assert!(w.ends_with(format!("worker-{idx}")));
+            assert!(w.join("package.json").is_file());
+            assert!(
+                !std::fs::symlink_metadata(w.join("src").join("calc.ts"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                !std::fs::symlink_metadata(w.join("src").join("calc.test.ts"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                std::fs::symlink_metadata(w.join("src").join("other.ts"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+
         delete_tree(&base).unwrap();
         assert!(!base.exists());
         let _ = std::fs::remove_dir_all(&root);

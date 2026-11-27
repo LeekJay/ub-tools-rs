@@ -98,7 +98,7 @@ Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\
 
 * Parallel file discovery, parsing, and AST extraction via `rayon` with pruned directory traversal (`SKIP_DIRS`, `lcov-report`).
 * Prefix-filtered Jaccard similarity in `dryer` with compact integer token interning, frequency ordering, length-ratio bounds, and two-pointer early-exit intersection.
-* Zero-regex LCOV parsing with basename buckets in `crapper`, plus `RwLock` + `NormalizedIndex` coverage caching, single-pass `.metrics/mutate/*.edn` history indexing, and skipped SHA-256 form hashing without prior history in `mutator`.
+* Zero-regex LCOV parsing with basename buckets in `crapper`, plus `RwLock` + `NormalizedIndex` coverage caching, single-pass `.metrics/mutate/*.edn` history indexing, skipped SHA-256 form hashing without prior history, reusable in-memory JS/TS reverse-import graphs, and parallel worker overlay creation and cleanup in `mutator`.
 
 ## Benchmarks
 
