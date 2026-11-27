@@ -45,6 +45,8 @@ pub fn make_entry(function: &Function, coverage: Option<f64>) -> Entry {
         complexity: function.complexity,
         coverage: rounded_cov,
         crap: score,
+        start_line: function.start_line,
+        end_line: function.end_line,
         path: function.path.clone(),
         language: function.language.clone(),
     }
@@ -62,6 +64,7 @@ fn compare_entries(a: &Entry, b: &Entry) -> Ordering {
         .then_with(|| a.namespace.cmp(&b.namespace))
         .then_with(|| a.name.cmp(&b.name))
         .then_with(|| a.path.cmp(&b.path))
+        .then_with(|| a.start_line.cmp(&b.start_line))
 }
 
 /// Worst CRAP first. Unscored rows follow scored rows.
@@ -82,6 +85,8 @@ mod tests {
             complexity,
             coverage: crap.map(|_| 100.0),
             crap,
+            start_line: 1,
+            end_line: 5,
             path: "src/demo/core.clj".to_string(),
             language: "clojure".to_string(),
         }

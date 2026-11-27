@@ -19,7 +19,7 @@ fn coverage_for(bundle: Option<&CoverageBundle>, function: &Function) -> Option<
     Some(b.percent_for(function).unwrap_or(0.0))
 }
 
-fn source_path(file: &Path, root: &Path) -> String {
+pub(crate) fn source_path(file: &Path, root: &Path) -> String {
     match file.strip_prefix(root) {
         Ok(rel) => to_posix(rel),
         Err(_) => to_posix(file),

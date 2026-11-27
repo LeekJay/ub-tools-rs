@@ -100,6 +100,8 @@ mod tests {
             complexity: 8,
             coverage,
             crap,
+            start_line: 1,
+            end_line: 10,
             path: "src/layout.clj".to_string(),
             language: "clojure".to_string(),
         }

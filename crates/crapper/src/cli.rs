@@ -1,14 +1,15 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use crate::analyze::analyze_resolved_files_with_cache;
+use crate::analyze::{analyze_resolved_files_with_cache, source_path};
 use crate::coverage::{CoverageBundle, load_bundle};
 use crate::discover::{
     CLOJURE_TEST_SUFFIXES, GO_TEST_SUFFIX, JS_TEST_SUFFIXES, SKIP_DIRS, TEST_DIRS,
     VUE_TEST_SUFFIXES, is_test_file, iter_source_files, language_of,
 };
+pub use crate::git_diff::GitError;
+use crate::git_diff::{ChangedLines, changed_scope, entry_overlaps_changes, run_git};
 use crate::metrics::write_metrics;
 use crate::model::Entry;
 use crate::path_util::{resolve_path, to_posix};
@@ -52,6 +53,11 @@ Options:
                                 May be repeated.
   --changed                     Analyze added and modified source files from
                                 git status.
+  --changed-functions           Analyze only functions overlapping git diff
+                                changes (plus all functions in new files).
+  --base <ref>                  Git base ref for --changed or
+                                --changed-functions (compares <ref> against
+                                working tree).
   --no-coverage                 Score complexity only. Coverage and CRAP are N/A.
   --use-existing-coverage       Read coverage already on disk. Do not rerun tests.
   --coverage-command <cmd>      Run this command instead of the per-language
@@ -109,6 +115,8 @@ pub struct Options {
     pub coverage_command: Option<String>,
     pub threshold: Option<f64>,
     pub changed: bool,
+    pub changed_functions: bool,
+    pub base: Option<String>,
     pub format: String,
     pub no_cache: bool,
 }
@@ -128,6 +136,8 @@ impl Default for Options {
             coverage_command: None,
             threshold: None,
             changed: false,
+            changed_functions: false,
+            base: None,
             format: "text".to_string(),
             no_cache: false,
         }
@@ -229,12 +239,27 @@ pub fn parse_args(args: &[String]) -> Options {
                 options.changed = true;
                 index += 1;
             }
+            "--changed-functions" => {
+                options.changed_functions = true;
+                index += 1;
+            }
+            "--base" => match take_value(args, index, arg) {
+                Ok(val) => {
+                    options.base = Some(val.to_string());
+                    index += 2;
+                }
+                Err(msg) => return help_error(msg, &help),
+            },
             s if s.starts_with('-') => return help_error(format!("Unknown option: {s}"), &help),
             _ => {
                 options.positionals.push(arg.clone());
                 index += 1;
             }
         }
+    }
+
+    if options.base.is_some() && !options.changed && !options.changed_functions {
+        return help_error("--base requires --changed or --changed-functions", &help);
     }
 
     if options.format != "text" && options.format != "json" {
@@ -258,23 +283,6 @@ pub fn parse_args(args: &[String]) -> Options {
         options.no_cache = true;
     }
     options
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitError {
-    pub code: i32,
-    pub message: String,
-}
-
-fn run_git(root: &Path, args: &[&str]) -> (i32, Vec<u8>, String) {
-    match Command::new("git").arg("-C").arg(root).args(args).output() {
-        Ok(out) => (
-            out.status.code().unwrap_or(1),
-            out.stdout,
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ),
-        Err(err) => (127, Vec::new(), err.to_string()),
-    }
 }
 
 fn changed_files(root: &Path) -> Result<Vec<PathBuf>, GitError> {
@@ -404,15 +412,65 @@ fn apply_filters(files: Vec<PathBuf>, filters: &[String]) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn select_files(options: &Options) -> Result<Vec<PathBuf>, GitError> {
-    let root = resolve_path(&options.project_root);
-    let (existing, filters) = positionals(&root, &options.positionals);
-    let picked = apply_filters(selected(options, &root, &existing)?, &filters);
+fn finalize_selected(files: Vec<PathBuf>, filters: &[String]) -> Vec<PathBuf> {
+    let picked = apply_filters(files, filters);
     let mut unique: BTreeSet<(String, PathBuf)> = BTreeSet::new();
     for resolved in picked {
         unique.insert((to_posix(&resolved), resolved));
     }
-    Ok(unique.into_iter().map(|(_, p)| p).collect())
+    unique.into_iter().map(|(_, p)| p).collect()
+}
+
+fn filter_by_existing(files: Vec<PathBuf>, existing: &[PathBuf]) -> Vec<PathBuf> {
+    if existing.is_empty() {
+        return files;
+    }
+    files
+        .into_iter()
+        .filter(|path| existing.iter().any(|e| path == e || path.starts_with(e)))
+        .collect()
+}
+
+struct ChangedSelection {
+    files: Vec<PathBuf>,
+    lines_by_path: Option<HashMap<String, ChangedLines>>,
+}
+
+fn resolve_selection(options: &Options, root: &Path) -> Result<ChangedSelection, GitError> {
+    let (existing, filters) = positionals(root, &options.positionals);
+    if options.changed_functions {
+        let scope = changed_scope(root, options.base.as_deref())?;
+        let mut lines_by_path = HashMap::with_capacity(scope.len());
+        let mut raw_files = Vec::with_capacity(scope.len());
+        for (path, lines) in scope {
+            lines_by_path.insert(source_path(&path, root), lines);
+            raw_files.push(path);
+        }
+        let filtered = filter_by_existing(raw_files, &existing);
+        return Ok(ChangedSelection {
+            files: finalize_selected(filtered, &filters),
+            lines_by_path: Some(lines_by_path),
+        });
+    }
+    if options.changed && options.base.is_some() {
+        let scope = changed_scope(root, options.base.as_deref())?;
+        let raw_files: Vec<PathBuf> = scope.into_iter().map(|(path, _)| path).collect();
+        let filtered = filter_by_existing(raw_files, &existing);
+        return Ok(ChangedSelection {
+            files: finalize_selected(filtered, &filters),
+            lines_by_path: None,
+        });
+    }
+    let raw_files = selected(options, root, &existing)?;
+    Ok(ChangedSelection {
+        files: finalize_selected(raw_files, &filters),
+        lines_by_path: None,
+    })
+}
+
+pub fn select_files(options: &Options) -> Result<Vec<PathBuf>, GitError> {
+    let root = resolve_path(&options.project_root);
+    resolve_selection(options, &root).map(|selection| selection.files)
 }
 
 fn coverage_bundle(options: &Options, root: &Path, files: &[PathBuf]) -> Option<CoverageBundle> {
@@ -472,13 +530,14 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     }
 
     let root = resolve_path(&options.project_root);
-    let files = match select_files(&options) {
-        Ok(f) => f,
+    let selection = match resolve_selection(&options, &root) {
+        Ok(s) => s,
         Err(exc) => {
             let _ = writeln!(err, "{}", exc.message);
             return exc.code;
         }
     };
+    let files = selection.files;
     if files.is_empty() {
         if options.format == "json" {
             let _ = write!(out, "{}", format_json(&[], options.threshold));
@@ -492,8 +551,11 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
 
     let mut bundle = coverage_bundle(&options, &root, &files);
-    let entries =
+    let mut entries =
         analyze_resolved_files_with_cache(&files, &root, bundle.as_mut(), !options.no_cache);
+    if let Some(ref changed_map) = selection.lines_by_path {
+        entries.retain(|entry| entry_overlaps_changes(entry, changed_map));
+    }
     let written_path = if options.no_metrics {
         None
     } else {
@@ -527,6 +589,7 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -881,5 +944,189 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    #[test]
+    fn options_and_help_support_changed_functions_and_base() {
+        let help = help_text();
+        assert!(help.contains("--changed-functions"));
+        assert!(help.contains("--base <ref>"));
+
+        let fn_only = parse_args(&["--changed-functions".to_string()]);
+        assert_eq!(fn_only.action, "analyze");
+        assert!(fn_only.changed_functions);
+        assert_eq!(fn_only.base, None);
+
+        let with_base = parse_args(&[
+            "--changed-functions".to_string(),
+            "--base".to_string(),
+            "main".to_string(),
+        ]);
+        assert_eq!(with_base.action, "analyze");
+        assert!(with_base.changed_functions);
+        assert_eq!(with_base.base.as_deref(), Some("main"));
+
+        let base_alone = parse_args(&["--base".to_string(), "main".to_string()]);
+        assert_eq!(base_alone.action, "help");
+        assert_eq!(base_alone.exit_code, 1);
+        assert!(
+            base_alone
+                .message
+                .contains("--base requires --changed or --changed-functions")
+        );
+
+        let missing_base = parse_args(&["--changed-functions".to_string(), "--base".to_string()]);
+        assert_eq!(missing_base.action, "help");
+        assert_eq!(missing_base.exit_code, 1);
+    }
+
+    #[test]
+    fn changed_functions_filters_untouched_legacy_and_supports_base_and_untracked() {
+        fn git_ok(root: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let dir = TestDir::new("git-changed-fns");
+        let root = &dir.0;
+        git_ok(root, &["init"]);
+        git_ok(root, &["config", "user.name", "Test User"]);
+        git_ok(root, &["config", "user.email", "test@example.com"]);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("coverage")).unwrap();
+
+        let initial_py = concat!(
+            "# header comment\n",
+            "def legacy_giant(a, b, c, d):\n",
+            "    if a > 0 and b > 0:\n",
+            "        if c > 0 or d > 0:\n",
+            "            return 1\n",
+            "        return 2\n",
+            "    return 0\n",
+            "\n",
+            "def small_ok(x):\n",
+            "    return x + 1\n",
+        );
+        fs::write(root.join("src/app.py"), initial_py).unwrap();
+        fs::write(
+            root.join("coverage/lcov.info"),
+            "SF:src/app.py\nDA:2,0\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,0\nDA:9,1\nDA:10,1\nend_of_record\n",
+        )
+        .unwrap();
+
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-m", "initial"]);
+
+        // Modify only `small_ok` in working tree.
+        let edited_py = concat!(
+            "# header comment\n",
+            "def legacy_giant(a, b, c, d):\n",
+            "    if a > 0 and b > 0:\n",
+            "        if c > 0 or d > 0:\n",
+            "            return 1\n",
+            "        return 2\n",
+            "    return 0\n",
+            "\n",
+            "def small_ok(x):\n",
+            "    return x + 2\n",
+        );
+        fs::write(root.join("src/app.py"), edited_py).unwrap();
+
+        let (whole_code, whole_out, _) =
+            run_fixture_cli(&dir, &["--changed", "--no-metrics", "--json"], "10.0");
+        assert_eq!(
+            whole_code, 2,
+            "whole-file --changed should fail on legacy_giant"
+        );
+        let whole_json: serde_json::Value = serde_json::from_str(&whole_out).unwrap();
+        assert_eq!(whole_json["summary"]["functions"], 2);
+
+        let (fn_code, fn_out, _) = run_fixture_cli(
+            &dir,
+            &["--changed-functions", "--no-metrics", "--json"],
+            "10.0",
+        );
+        assert_eq!(
+            fn_code, 0,
+            "--changed-functions should ignore untouched legacy_giant: {fn_out}"
+        );
+        let fn_json: serde_json::Value = serde_json::from_str(&fn_out).unwrap();
+        assert_eq!(fn_json["summary"]["functions"], 1);
+        assert_eq!(fn_json["entries"][0]["name"], "small_ok");
+        assert_eq!(fn_json["entries"][0]["start_line"], 9);
+        assert_eq!(fn_json["entries"][0]["end_line"], 10);
+
+        // Add untracked new file and verify `--changed-functions` picks up its functions.
+        fs::write(
+            root.join("src/new_mod.py"),
+            "def brand_new(y):\n    return y * 2\n",
+        )
+        .unwrap();
+        let (untracked_code, untracked_out, _) = run_fixture_cli(
+            &dir,
+            &["--changed-functions", "--no-metrics", "--json"],
+            "10.0",
+        );
+        assert_eq!(untracked_code, 0);
+        let untracked_json: serde_json::Value = serde_json::from_str(&untracked_out).unwrap();
+        let names: Vec<&str> = untracked_json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"small_ok"));
+        assert!(names.contains(&"brand_new"));
+
+        // Commit changes and verify `--base HEAD~1` works post-commit.
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-m", "edit small_ok and add new_mod"]);
+        let (base_code, base_out, _) = run_fixture_cli(
+            &dir,
+            &[
+                "--changed-functions",
+                "--base",
+                "HEAD~1",
+                "--no-metrics",
+                "--json",
+            ],
+            "10.0",
+        );
+        assert_eq!(base_code, 0, "--base HEAD~1 output: {base_out}");
+        let base_json: serde_json::Value = serde_json::from_str(&base_out).unwrap();
+        let base_names: Vec<&str> = base_json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(base_names.len(), 2);
+        assert!(base_names.contains(&"small_ok"));
+        assert!(base_names.contains(&"brand_new"));
+
+        // Edit only top-level comment outside functions -> empty entries, exit 0.
+        let comment_only = edited_py.replace("# header comment", "# updated comment");
+        fs::write(root.join("src/app.py"), comment_only).unwrap();
+        let (comment_code, comment_out, _) = run_fixture_cli(
+            &dir,
+            &["--changed-functions", "--no-metrics", "--json"],
+            "10.0",
+        );
+        assert_eq!(comment_code, 0);
+        let comment_json: serde_json::Value = serde_json::from_str(&comment_out).unwrap();
+        assert_eq!(comment_json["summary"]["functions"], 0);
+        assert_eq!(comment_json["entries"], serde_json::json!([]));
     }
 }

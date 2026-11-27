@@ -107,7 +107,7 @@ Every time you are asked to make a change follow:
 
 ## Crapper
 
-* Use the crapper tool (`--json`, scoped with `--changed` or target paths; add `--no-metrics` during intermediate checks to keep `.metrics/` clean).
+* Use the crapper tool (`--changed-functions --json`, adding `--base <ref>` for committed branch diffs and `--no-metrics` during intermediate checks to keep `.metrics/` clean; use `--changed` or target paths for whole-file scans).
 * Reduce each function under  CRAP 10 by splitting it, by testing it, or both.
 * Consider whether case statements are worth reducing.
 

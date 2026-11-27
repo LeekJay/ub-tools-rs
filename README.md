@@ -6,7 +6,7 @@ Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's qu
 
 ![Rust Edition 2024](https://img.shields.io/badge/Rust-Edition_2024-dea584?style=flat-square&logo=rust&logoColor=white)
 ![Unsafe Forbidden](https://img.shields.io/badge/unsafe-forbidden-2ea44f?style=flat-square)
-![Tests 149 Passing](https://img.shields.io/badge/tests-149_passing-2ea44f?style=flat-square)
+![Tests 153 Passing](https://img.shields.io/badge/tests-153_passing-2ea44f?style=flat-square)
 ![License 0BSD and MIT](https://img.shields.io/badge/license-0BSD_%2F_MIT-0969da?style=flat-square)
 
 [Quick Start](#quick-start) · [Workspace](#workspace) · [Agent Skills](#agent-skills) · [Safeguards](#safeguards) · [Benchmarks](#benchmarks) · [Configuration](#configuration)
@@ -42,7 +42,7 @@ cargo install --path crates/mutator
 Run read-only scoped checks from any project root with structured JSON output.
 
 ```sh
-crapper --no-metrics --json --changed
+crapper --no-metrics --json --changed-functions
 dryer --no-metrics --json --threshold 0.8
 mutator --scan --json --changed
 ```
@@ -64,8 +64,8 @@ Bundled skills under `skills/` preconfigure AI coding agents to pass `--json`, `
 
 | Skill | Purpose | Default CLI Flags | License |
 | --- | --- | --- | --- |
-| [`skills/ub-mode/`](skills/ub-mode/README.md) | Incremental coding discipline across `crapper`, `dryer`, and `mutator` | `--json`, `--changed`, intermediate `--no-metrics`, `mutator --scan --json` | MIT ([LICENSE](skills/ub-mode/LICENSE)) |
-| [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) | Read-only quality verification after scoped code changes | `--no-metrics --json --changed`, `dryer --threshold 0.8`, `mutator --scan --json` | 0BSD ([LICENSE](LICENSE)) |
+| [`skills/ub-mode/`](skills/ub-mode/README.md) | Incremental coding discipline across `crapper`, `dryer`, and `mutator` | `--changed-functions --json`, intermediate `--no-metrics`, `mutator --scan --json` | MIT ([LICENSE](skills/ub-mode/LICENSE)) |
+| [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) | Read-only quality verification after scoped code changes | `crapper --changed-functions --no-metrics --json`, `dryer --threshold 0.8`, `mutator --scan --json` | 0BSD ([LICENSE](LICENSE)) |
 
 Install both skills into your agent's skills directory (for example `~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, `~/.gemini/skills/`, or `~/.grok/skills/`).
 
@@ -92,7 +92,7 @@ Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\
 
 * **Per-repository `UBC1` caches** store parsed AST complexity records in `crapper`, compact 128-bit truncated SHA-256 subtree fingerprint hashes in `dryer`, and discovered mutation sites in `mutator`, placed outside repositories under the cache directory.
 * **Stamps and zero-write warm hits** invalidate per file via `(mtime_ns, size)` plus nearest `go.mod`, `Cargo.toml`, and `Package.swift` manifest stamps in `crapper` and `mutator`; warm runs with zero misses skip rewriting cache files and keep exact stdout parity.
-* **Bypass, live progress, and JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`), stream per-site `mutator` progress to `stderr`, and emit versioned `v1` JSON on `stdout` via `--json` (plus `--format json` in `crapper` and `dryer`) with matching exit codes.
+* **Bypass, live progress, and JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`), stream per-site `mutator` progress to `stderr`, support function-level `crapper --changed-functions` (with optional `--base <ref>`), and emit versioned `v1` JSON on `stdout` (including `start_line` and `end_line` in `crapper`) via `--json` with matching exit codes.
 
 ### Core Rust optimizations
 

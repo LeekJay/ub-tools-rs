@@ -125,6 +125,8 @@ mod tests {
             complexity: 2,
             coverage: None,
             crap: None,
+            start_line: 1,
+            end_line: 3,
             path: "src/café.py".to_string(),
             language: "python".to_string(),
         };
@@ -162,6 +164,8 @@ mod tests {
                 complexity: 5,
                 coverage: Some(0.0),
                 crap: Some(30.0),
+                start_line: 10,
+                end_line: 25,
                 path: "src/z.rs".to_string(),
                 language: "rust".to_string(),
             },
@@ -171,6 +175,8 @@ mod tests {
                 complexity: 8,
                 coverage: None,
                 crap: None,
+                start_line: 1,
+                end_line: 12,
                 path: "src/a.py".to_string(),
                 language: "python".to_string(),
             },
@@ -180,6 +186,8 @@ mod tests {
                 complexity: 1,
                 coverage: Some(100.0),
                 crap: Some(1.0),
+                start_line: 4,
+                end_line: 6,
                 path: "src/b.py".to_string(),
                 language: String::new(),
             },
@@ -198,6 +206,8 @@ mod tests {
         assert_eq!(below_val["summary"]["threshold"], 30.0);
         assert_eq!(below_val["summary"]["threshold_exceeded"], false);
         assert_eq!(below_val["entries"][0]["name"], "zeta");
+        assert_eq!(below_val["entries"][0]["start_line"], 10);
+        assert_eq!(below_val["entries"][0]["end_line"], 25);
 
         let above = format_json(&entries, Some(29.9));
         let above_val: serde_json::Value = serde_json::from_str(&above).expect("valid above json");

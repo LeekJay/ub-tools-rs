@@ -14,4 +14,5 @@ pub mod model;
 pub mod report;
 pub mod runners;
 
+pub(crate) mod git_diff;
 pub(crate) mod path_util;

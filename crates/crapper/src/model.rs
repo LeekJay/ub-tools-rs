@@ -50,6 +50,8 @@ pub struct Entry {
     pub complexity: usize,
     pub coverage: Option<f64>,
     pub crap: Option<f64>,
+    pub start_line: usize,
+    pub end_line: usize,
     pub path: String,
     pub language: String,
 }
