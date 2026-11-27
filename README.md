@@ -1,42 +1,37 @@
+<div align="center">
+
 # ub-tools-rs
 
-Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's three software metrics CLIs, collected in a single Cargo workspace so `mutator`, `crapper`, and `dryer` compile together cleanly without a Python runtime.
+Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's quality-gate CLIs with incremental caching, structured JSON output, and multi-agent safeguards.
 
-## Upstream projects and Python PRs
+![Rust Edition 2024](https://img.shields.io/badge/Rust-Edition_2024-dea584?style=flat-square&logo=rust&logoColor=white)
+![Unsafe Forbidden](https://img.shields.io/badge/unsafe-forbidden-2ea44f?style=flat-square)
+![Tests 145 Passing](https://img.shields.io/badge/tests-145_passing-2ea44f?style=flat-square)
+![License 0BSD and MIT](https://img.shields.io/badge/license-0BSD_%2F_MIT-0969da?style=flat-square)
 
-* [unclebob/crapper](https://github.com/unclebob/crapper) paired with performance PR [unclebob/crapper#50](https://github.com/unclebob/crapper/pull/50)
-* [unclebob/dryer](https://github.com/unclebob/dryer) paired with performance PR [unclebob/dryer#31](https://github.com/unclebob/dryer/pull/31)
-* [unclebob/mutator](https://github.com/unclebob/mutator) paired with performance PR [unclebob/mutator#47](https://github.com/unclebob/mutator/pull/47)
-* [unclebob/ub-mode](https://github.com/unclebob/ub-mode) used as the upstream base for [`skills/ub-mode/`](skills/ub-mode/README.md)
+[Quick Start](#quick-start) · [Workspace](#workspace) · [Agent Skills](#agent-skills) · [Safeguards](#safeguards) · [Benchmarks](#benchmarks) · [Configuration](#configuration)
 
-## Workspace crates
+</div>
 
-* `crates/crapper` scores cyclomatic complexity and coverage into `.metrics/crap.edn` across Clojure, Java, Go, TypeScript, JavaScript, Vue SFC, Rust, Python, and Swift.
-* `crates/dryer` detects structural code duplicates via normalized AST fingerprints and Jaccard similarity into `.metrics/dry.edn`.
-* `crates/mutator` runs coverage-guided mutation testing across `.metrics/mutate/*.edn` snapshots and links `crapper` coverage and language discovery directly as a library crate (`crapper_lib`).
-* `crates/ub-runtime` provides shared OS process priority, thread caps, atomic `.edn` writes, kernel file locks, and the `UBC1` binary cache codec across the CLIs.
-
-## Agent skills
-
-Bundled markdown skills under `skills/` configure AI coding agents to invoke the `ub-tools-rs` CLIs with `--json`, `--changed`, and `--no-metrics`.
-
-* [`skills/ub-mode/`](skills/ub-mode/README.md) (`ub-mode/SKILL.md`) enforces disciplined incremental development backed by `crapper`, `dryer`, and `mutator`.
-* [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) (`ub-quality-gate/SKILL.md`) provides read-only verification after scoped code changes.
-
-```sh
-cp -r skills/ub-mode skills/ub-quality-gate ~/.claude/skills/
+```mermaid
+flowchart LR
+    Agent["AI Agents or Terminal"] --> Skills["skills/ub-mode and skills/ub-quality-gate"]
+    Skills --> Tools["crapper, dryer, and mutator"]
+    Agent --> Tools
+    Tools --> Runtime["ub-runtime (priority, caps, locks, UBC1 cache)"]
+    Runtime --> Outputs["Text reports, v1 JSON stdout, or .metrics/*.edn"]
 ```
 
-## Build and test
+## Quick Start
 
-Requires Rust with edition `2024` support.
+Requires Rust with edition `2024` support. Build and test the full workspace cleanly without a Python runtime.
 
 ```sh
 cargo test --workspace
 cargo build --release --workspace
 ```
 
-Compiled binaries land under `target/release/` (`crapper`, `dryer`, `mutator`). You can also install individual tools locally.
+Compiled binaries land under `target/release/` (`crapper`, `dryer`, `mutator`), or you can install them into Cargo's bin directory.
 
 ```sh
 cargo install --path crates/crapper
@@ -44,47 +39,85 @@ cargo install --path crates/dryer
 cargo install --path crates/mutator
 ```
 
-## Key optimizations
+Run read-only scoped checks from any project root with structured JSON output.
 
-* Parallel file discovery, parsing, and AST extraction powered by `rayon`.
-* Prefix-filtered Jaccard matching in `dryer` with compact integer token interning, frequency ordering, length-ratio bounds, and two-pointer early-exit intersection.
-* Zero-regex LCOV parsing plus basename-bucketed key indexing and `SKIP_DIRS` / `lcov-report` directory pruning in `crapper`.
-* Per-run coverage caching (`RwLock` + `NormalizedIndex`), single-pass `.metrics/mutate/*.edn` history indexing, and skipped SHA-256 form hashing when no prior history exists in `mutator`.
+```sh
+crapper --no-metrics --json --changed
+dryer --no-metrics --json --threshold 0.8
+mutator --scan --json --changed
+```
 
-## Multi-agent and anti-stutter safeguards
+## Workspace
 
-All binaries initialize `ub-runtime` at startup so parallel agent runs stay responsive and avoid corrupting `.metrics/` files.
+| Crate | Scope and Languages | Output Artifacts | Upstream and PR |
+| --- | --- | --- | --- |
+| [`crates/crapper`](crates/crapper) | Cyclomatic complexity and coverage across 8 languages (Clojure, Java, Go, TypeScript/JS, Vue SFC, Rust, Python, Swift) | `.metrics/crap.edn`, text report, `v1` JSON | [unclebob/crapper](https://github.com/unclebob/crapper) ([PR #50](https://github.com/unclebob/crapper/pull/50)) |
+| [`crates/dryer`](crates/dryer) | Structural code duplication via normalized AST fingerprints across the same 8 languages | `.metrics/dry.edn`, text, EDN, `v1` JSON | [unclebob/dryer](https://github.com/unclebob/dryer) ([PR #31](https://github.com/unclebob/dryer/pull/31)) |
+| [`crates/mutator`](crates/mutator) | Coverage-guided mutation testing across 7 languages (Clojure, Java, Go, TypeScript/JS, Rust, Python, Swift), links `crapper_lib` | `.metrics/mutate/*.edn`, text, `--scan` / mutate `v1` JSON | [unclebob/mutator](https://github.com/unclebob/mutator) ([PR #47](https://github.com/unclebob/mutator/pull/47)) |
+| [`crates/ub-runtime`](crates/ub-runtime) | Shared OS priority, thread/worker caps, global scan throttle, kernel file locks, atomic writes, and `UBC1` cache codec | Shared runtime library | Internal shared crate |
 
-* **Lowered OS priority** sets the process to `Below Normal` on Windows by default (`UB_TOOLS_PRIORITY`), and child test or coverage commands inherit that priority.
-* **Capped thread and worker pools** bound `rayon` to `min(6, cores/2)` (at least `1`) and `mutator` workers to `min(4, cores/4)` (at least `1`) unless overridden.
-* **Cross-process scan slots** limit concurrent `crapper`, `dryer`, and `mutator --scan` invocations to `2` global slots under `ub-tools-locks/` in the system temp directory.
-* **OS kernel file locks** under `ub-tools-locks/` in the system temp directory serialize per-repository coverage runs, `mutator` executions, and `.metrics/mutate/*.edn` updates while allowing shared history reads.
-* **Atomic `.edn` writes** stage metric output in unique sibling temp files, flush and close handles before renaming, and retry transient Windows sharing errors.
+Companion upstream skill repo [unclebob/ub-mode](https://github.com/unclebob/ub-mode) serves as the base for [`skills/ub-mode/`](skills/ub-mode/README.md).
+
+## Agent Skills
+
+Bundled skills under `skills/` preconfigure AI coding agents to pass `--json`, `--changed`, and read-only `--no-metrics` flags automatically.
+
+| Skill | Purpose | Default CLI Flags | License |
+| --- | --- | --- | --- |
+| [`skills/ub-mode/`](skills/ub-mode/README.md) | Incremental coding discipline across `crapper`, `dryer`, and `mutator` | `--json`, `--changed`, intermediate `--no-metrics`, `mutator --scan --json` | MIT ([LICENSE](skills/ub-mode/LICENSE)) |
+| [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) | Read-only quality verification after scoped code changes | `--no-metrics --json --changed`, `dryer --threshold 0.8`, `mutator --scan --json` | 0BSD ([LICENSE](LICENSE)) |
+
+Install both skills into your agent's skills directory (for example `~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, `~/.gemini/skills/`, or `~/.grok/skills/`).
+
+```sh
+cp -r skills/ub-mode skills/ub-quality-gate ~/.claude/skills/
+```
+
+```powershell
+Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\"
+```
+
+## Safeguards
+
+> [!TIP]
+> All three CLIs initialize `ub-runtime` automatically so concurrent multi-agent tool calls keep host editors responsive and prevent `.metrics/` corruption.
+
+* **Lowered OS priority** runs processes at `Below Normal` on Windows by default (`UB_TOOLS_PRIORITY`), and spawned test or coverage subprocesses inherit that priority.
+* **Bounded CPU pools** cap `rayon` threads at `min(6, cores/2)` (at least `1`) and `mutator` workers at `min(4, cores/4)` (at least `1`).
+* **Cross-process scan slots** limit concurrent `crapper`, `dryer`, and `mutator --scan` runs to `2` global slots via OS locks under `ub-tools-locks/` in the system temp directory.
+* **Repository kernel locks and atomic `.edn` writes** serialize per-repo coverage runs, mutation runs, and `.metrics/mutate/*.edn` updates while staging writes in unique sibling temp files with Windows sharing retries.
 * **Report-only mode** via `--no-metrics` (or `UB_TOOLS_NO_METRICS`) prints `crapper` and `dryer` reports and preserves threshold exit codes without touching `.metrics/`.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `UB_TOOLS_PRIORITY` | `below_normal` | Set priority (`below_normal`, `low`, `idle`, or `normal`) for CLIs and children |
-| `UB_TOOLS_THREADS` | `min(6, cores/2)` | Override the `rayon` global thread pool size (falls back to `RAYON_NUM_THREADS` when unset) |
-| `UB_TOOLS_MUTATOR_WORKERS` | `min(4, cores/4)` | Override default `mutator` worker count when `--max-workers` is omitted |
-| `UB_TOOLS_MAX_CONCURRENT` | `2` | Set global scan lock slots across `crapper`, `dryer`, and `mutator --scan` (`0` disables) |
-| `UB_TOOLS_NO_METRICS` | unset | Skip writing `.metrics/crap.edn` and `.metrics/dry.edn` when set to `1`, `true`, or `yes` |
-| `UB_TOOLS_CACHE_DIR` | OS cache dir (`%LOCALAPPDATA%\ub-tools-cache` on Windows, `$XDG_CACHE_HOME/ub-tools-cache` or `~/.cache/ub-tools-cache` elsewhere) | Override directory storing per-repository `UBC1` incremental cache files |
-| `UB_TOOLS_NO_CACHE` | unset | Disable reading and writing `UBC1` incremental cache files when set to `1`, `true`, or `yes` |
+### Incremental caching and JSON output
 
-## Incremental cache and JSON output
+* **Per-repository `UBC1` caches** store parsed AST complexity records in `crapper`, compact 128-bit truncated SHA-256 subtree fingerprint hashes in `dryer`, and discovered mutation sites in `mutator`, placed outside repositories under the cache directory.
+* **Stamps and zero-write warm hits** invalidate per file via `(mtime_ns, size)` plus nearest `go.mod`, `Cargo.toml`, and `Package.swift` manifest stamps in `crapper` and `mutator`; warm runs with zero misses skip rewriting cache files and keep exact stdout parity.
+* **Bypass and structured JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`) and emit versioned `v1` JSON via `--json` (plus `--format json` in `crapper` and `dryer`) while keeping exit codes and stderr diagnostics unchanged.
 
-* **Per-repository binary caches (`UBC1`)** store parsed complexity records in `crapper`, compact 128-bit truncated SHA-256 subtree fingerprint hashes in `dryer`, and discovered mutation sites in `mutator`, stored outside the project tree under the cache directory.
-* **Automatic invalidation** checks each source file's `(mtime_ns, size)` stamp and, in `crapper` and `mutator`, also checks nearest `go.mod`, `Cargo.toml`, and `Package.swift` manifest stamps; warm runs with zero cache misses skip rewriting the cache file and keep byte-for-byte CLI output parity.
-* **Cache bypass** via `--no-cache` or `UB_TOOLS_NO_CACHE=1` skips both cache reads and cache writes.
-* **Structured JSON output** is available across all three CLIs (`crapper --json` or `--format json`, `dryer --json` or `--format json`, `mutator --json` and `mutator --scan --json`), emitting versioned `v1` JSON documents to `stdout` while keeping threshold exit codes and stderr diagnostics unchanged.
+### Core Rust optimizations
 
-## Measured benchmarks
+* Parallel file discovery, parsing, and AST extraction via `rayon` with pruned directory traversal (`SKIP_DIRS`, `lcov-report`).
+* Prefix-filtered Jaccard similarity in `dryer` with compact integer token interning, frequency ordering, length-ratio bounds, and two-pointer early-exit intersection.
+* Zero-regex LCOV parsing with basename buckets in `crapper`, plus `RwLock` + `NormalizedIndex` coverage caching, single-pass `.metrics/mutate/*.edn` history indexing, and skipped SHA-256 form hashing without prior history in `mutator`.
 
-Measured on a static snapshot of a real 3,522-file TypeScript monorepo (`src/domain` holds 217 files and 811 functions; full `src` holds 2,097 non-test files and 10,173 functions; coverage comes from 3.5 MB plus 5.4 MB `lcov.info` files alongside ~5,500 HTML files under `lcov-report`). All Rust CLI times include process startup and file output.
+## Benchmarks
+
+### Cold vs. warm incremental cache
+
+Measured on a 3,559-file static TypeScript monorepo snapshot with warm OS page cache (median of 3 runs per mode, `UB_TOOLS_CACHE_DIR` in an isolated temp directory, 100% byte-for-byte text parity across all modes).
+
+| Workload | `--no-cache` | Cold cache | Warm cache | Speedup vs. uncached | Cache size |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `crapper` full `src` (`--no-coverage --no-metrics`, 12,861 fns) | 903.0 ms | 1,046.1 ms | 171.9 ms | 5.25x | 1.61 MB |
+| `dryer` full `src` (`--threshold 0.8 --no-metrics`, 4,397 dups) | 1,923.2 ms | 4,488.8 ms | 248.3 ms | 7.75x | 15.00 MB |
+| `mutator --scan` full `src` (`--no-coverage`, 66,259 sites) | 1,862.4 ms | 2,040.1 ms | 306.4 ms | 6.08x | 16.07 MB |
+
+### Python baseline vs. Rust CLI
+
+Measured on a static snapshot of a 3,522-file TypeScript monorepo (`src/domain` holds 217 files and 811 functions; full `src` holds 2,097 non-test files and 10,173 functions; coverage comes from 3.5 MB plus 5.4 MB `lcov.info` files alongside ~5,500 HTML files under `lcov-report`). Rust CLI timings include process startup and file output.
 
 | Workload | Python before | Python after (PRs) | Rust CLI (`ub-tools-rs`) |
-| --- | --- | --- | --- |
+| --- | ---: | ---: | ---: |
 | `crapper` `src/domain` (`--no-coverage`) | 511.2 ms (in-process) | 701.3 ms (in-process) | 119.2 ms |
 | `crapper` full `src` (`--no-coverage`) | 25,330.0 ms (in-process) | 6,453.0 ms (in-process) | 1,238.0 ms |
 | `crapper` `src/domain` (with coverage) | 4,387.3 ms (in-process) | 1,566.8 ms (in-process) | 850.3 ms |
@@ -95,15 +128,17 @@ Measured on a static snapshot of a real 3,522-file TypeScript monorepo (`src/dom
 | `mutator --scan` `src/domain` (`--no-coverage`) | 5,704.9 ms | 3,206.9 ms | 368.5 ms |
 | `mutator --scan` full `src` (with coverage) | not run | not run | 4,519.9 ms |
 
-### Cold vs. warm incremental cache benchmarks
+## Configuration
 
-Measured on a 3,559-file static TypeScript monorepo snapshot with warm OS page cache (median of 3 runs per mode, `ub-tools-cache` stored in an isolated temp cache directory).
-
-| Workload | `--no-cache` | Cold cache | Warm cache | Speedup vs. uncached | Cache size |
-| --- | --- | --- | --- | --- | --- |
-| `crapper` full `src` (`--no-coverage --no-metrics`, 12,861 fns) | 903.0 ms | 1,046.1 ms | 171.9 ms | 5.25x | 1.61 MB |
-| `dryer` full `src` (`--threshold 0.8 --no-metrics`, 4,397 dups) | 1,923.2 ms | 4,488.8 ms | 248.3 ms | 7.75x | 15.00 MB |
-| `mutator --scan` full `src` (`--no-coverage`, 66,259 sites) | 1,862.4 ms | 2,040.1 ms | 306.4 ms | 6.08x | 16.07 MB |
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `UB_TOOLS_PRIORITY` | `below_normal` | Process priority (`below_normal`, `low`, `idle`, or `normal`) for CLIs and children |
+| `UB_TOOLS_THREADS` | `min(6, cores/2)` | Override `rayon` global thread pool size (falls back to `RAYON_NUM_THREADS` when unset) |
+| `UB_TOOLS_MUTATOR_WORKERS` | `min(4, cores/4)` | Override default `mutator` worker count when `--max-workers` is omitted |
+| `UB_TOOLS_MAX_CONCURRENT` | `2` | Global scan lock slots across `crapper`, `dryer`, and `mutator --scan` (`0` disables) |
+| `UB_TOOLS_NO_METRICS` | unset | Skip writing `.metrics/crap.edn` and `.metrics/dry.edn` when set to `1`, `true`, or `yes` |
+| `UB_TOOLS_CACHE_DIR` | OS cache dir (`%LOCALAPPDATA%\ub-tools-cache` or `~/.cache/ub-tools-cache`) | Override directory storing per-repository `UBC1` incremental cache files |
+| `UB_TOOLS_NO_CACHE` | unset | Disable reading and writing `UBC1` incremental cache files when set to `1`, `true`, or `yes` |
 
 ## License
 
