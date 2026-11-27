@@ -7,6 +7,7 @@ Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's th
 * [unclebob/crapper](https://github.com/unclebob/crapper) paired with performance PR [unclebob/crapper#50](https://github.com/unclebob/crapper/pull/50)
 * [unclebob/dryer](https://github.com/unclebob/dryer) paired with performance PR [unclebob/dryer#31](https://github.com/unclebob/dryer/pull/31)
 * [unclebob/mutator](https://github.com/unclebob/mutator) paired with performance PR [unclebob/mutator#47](https://github.com/unclebob/mutator/pull/47)
+* [unclebob/ub-mode](https://github.com/unclebob/ub-mode) used as the upstream base for [`skills/ub-mode/`](skills/ub-mode/README.md)
 
 ## Workspace crates
 
@@ -14,6 +15,17 @@ Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's th
 * `crates/dryer` detects structural code duplicates via normalized AST fingerprints and Jaccard similarity into `.metrics/dry.edn`.
 * `crates/mutator` runs coverage-guided mutation testing across `.metrics/mutate/*.edn` snapshots and links `crapper` coverage and language discovery directly as a library crate (`crapper_lib`).
 * `crates/ub-runtime` provides shared OS process priority, thread caps, atomic `.edn` writes, kernel file locks, and the `UBC1` binary cache codec across the CLIs.
+
+## Agent skills
+
+Bundled markdown skills under `skills/` configure AI coding agents to invoke the `ub-tools-rs` CLIs with `--json`, `--changed`, and `--no-metrics`.
+
+* [`skills/ub-mode/`](skills/ub-mode/README.md) (`ub-mode/SKILL.md`) enforces disciplined incremental development backed by `crapper`, `dryer`, and `mutator`.
+* [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) (`ub-quality-gate/SKILL.md`) provides read-only verification after scoped code changes.
+
+```sh
+cp -r skills/ub-mode skills/ub-quality-gate ~/.claude/skills/
+```
 
 ## Build and test
 
@@ -95,4 +107,4 @@ Measured on a 3,559-file static TypeScript monorepo snapshot with warm OS page c
 
 ## License
 
-BSD Zero Clause License (`0BSD`). Preserves upstream copyright attribution to Robert C. Martin in [LICENSE](LICENSE).
+The Rust workspace and [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) use the BSD Zero Clause License (`0BSD`) preserving upstream attribution to Robert C. Martin in [LICENSE](LICENSE), while [`skills/ub-mode/`](skills/ub-mode/README.md) preserves its upstream MIT License in [skills/ub-mode/LICENSE](skills/ub-mode/LICENSE).
