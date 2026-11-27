@@ -94,6 +94,10 @@ pub struct RunResult {
     #[serde(default)]
     pub statuses: HashMap<String, String>,
     #[serde(default)]
+    pub executed_killed: usize,
+    #[serde(default)]
+    pub executed_survived: usize,
+    #[serde(default)]
     pub baseline_failed: bool,
     #[serde(default)]
     pub baseline_message: String,

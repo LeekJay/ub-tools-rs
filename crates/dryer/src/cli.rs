@@ -1,6 +1,6 @@
 //! Command line parsing, git-changed file selection, and report orchestration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,6 +43,11 @@ Options:
                                 May be repeated.
   --changed                     Compare added and modified source files from
                                 git status.
+  --focus-changed               Scan full target scope, but report only
+                                duplicate pairs touching a git-changed file
+                                (implies --no-metrics).
+  --base <ref>                  Git base ref for --changed or --focus-changed
+                                (compares <ref> against working tree).
   --threshold N                 Minimum similarity score, default 0.82.
   --min-lines N                 Minimum source lines in a candidate form,
                                 default 4.
@@ -103,6 +108,8 @@ pub struct Options {
     pub min_nodes: usize,
     pub format: String,
     pub changed: bool,
+    pub focus_changed: bool,
+    pub base: Option<String>,
     pub no_metrics: bool,
     pub no_cache: bool,
 }
@@ -121,6 +128,8 @@ impl Default for Options {
             min_nodes: 20,
             format: "text".to_string(),
             changed: false,
+            focus_changed: false,
+            base: None,
             no_metrics: false,
             no_cache: false,
         }
@@ -246,6 +255,14 @@ pub fn parse_args(args: &[String]) -> Options {
                 options.changed = true;
                 Ok(1)
             }
+            "--focus-changed" => {
+                options.focus_changed = true;
+                Ok(1)
+            }
+            "--base" => take_value(args, index, arg).map(|v| {
+                options.base = Some(v.to_string());
+                2
+            }),
             "--no-metrics" => {
                 options.no_metrics = true;
                 Ok(1)
@@ -273,6 +290,30 @@ pub fn parse_args(args: &[String]) -> Options {
         }
     }
 
+    if options.changed && options.focus_changed {
+        return Options {
+            action: Action::Help,
+            message: format!(
+                "--changed cannot be combined with --focus-changed\n\n{}",
+                help_text()
+            ),
+            exit_code: 1,
+            ..Options::default()
+        };
+    }
+
+    if options.base.is_some() && !options.changed && !options.focus_changed {
+        return Options {
+            action: Action::Help,
+            message: format!(
+                "--base requires --changed or --focus-changed\n\n{}",
+                help_text()
+            ),
+            exit_code: 1,
+            ..Options::default()
+        };
+    }
+
     if !matches!(options.format.as_str(), "text" | "edn" | "json") {
         return Options {
             action: Action::Format,
@@ -283,7 +324,7 @@ pub fn parse_args(args: &[String]) -> Options {
     }
 
     if options.action == Action::Scan {
-        if ub_runtime::env_no_metrics() {
+        if options.focus_changed || ub_runtime::env_no_metrics() {
             options.no_metrics = true;
         }
         if ub_runtime::env_no_cache() {
@@ -298,6 +339,15 @@ pub fn parse_args(args: &[String]) -> Options {
 pub struct GitStatusError {
     pub code: i32,
     pub message: String,
+}
+
+impl From<ub_runtime::GitCommandError> for GitStatusError {
+    fn from(err: ub_runtime::GitCommandError) -> Self {
+        Self {
+            code: err.code,
+            message: err.message,
+        }
+    }
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, GitStatusError> {
@@ -390,6 +440,21 @@ fn changed_source(root: &Path) -> Result<Vec<PathBuf>, GitStatusError> {
         .collect())
 }
 
+fn changed_source_with_base(
+    root: &Path,
+    base: Option<&str>,
+) -> Result<Vec<PathBuf>, GitStatusError> {
+    if base.is_none() {
+        return changed_source(root);
+    }
+    let entries = ub_runtime::git_changed_lines(root, base)?;
+    Ok(entries
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| tracked_source(path, Some(root)))
+        .collect())
+}
+
 fn positionals(root: &Path, args: &[String]) -> (Vec<PathBuf>, Vec<String>) {
     let mut existing = Vec::new();
     let mut filters = Vec::new();
@@ -426,7 +491,7 @@ fn selected(
     existing: &[PathBuf],
 ) -> Result<Vec<PathBuf>, GitStatusError> {
     if options.changed {
-        return changed_source(root);
+        return changed_source_with_base(root, options.base.as_deref());
     }
     if !options.source_roots.is_empty() {
         let roots: Vec<PathBuf> = options
@@ -480,6 +545,36 @@ fn format_report(
     }
 }
 
+fn write_dryer_summary(
+    err: &mut dyn Write,
+    candidates: &[super::model::Duplicate],
+    entries_scanned: usize,
+    threshold: f64,
+) {
+    if candidates.is_empty() {
+        let _ = writeln!(
+            err,
+            "[dryer] PASS (exit 0): 0 duplicate pairs >= {threshold:.2} ({entries_scanned} forms scanned)."
+        );
+        return;
+    }
+    let count = candidates.len();
+    let pair_word = if count == 1 { "pair" } else { "pairs" };
+    if let Some(top) = candidates.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
+        let _ = writeln!(
+            err,
+            "[dryer] FOUND (exit 0, review required): {count} duplicate {pair_word} >= {threshold:.2} ({entries_scanned} forms scanned; top: score={:.2} {}:{}-{} <-> {}:{}-{}). Exit 0 does not mean clean; inspect stdout candidates.",
+            top.score,
+            top.left.file,
+            top.left.start_line,
+            top.left.end_line,
+            top.right.file,
+            top.right.start_line,
+            top.right.end_line,
+        );
+    }
+}
+
 pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let options = parse_args(args);
     match options.action {
@@ -505,6 +600,38 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
     }
 
     let root = resolve_path(&options.project_root);
+    let focused_set = if options.focus_changed {
+        let changed = match changed_source_with_base(&root, options.base.as_deref()) {
+            Ok(files) => files,
+            Err(git_err) => {
+                let _ = writeln!(err, "{}", git_err.message);
+                return git_err.code;
+            }
+        };
+        let set: HashSet<String> = changed
+            .into_iter()
+            .map(|path| match path.strip_prefix(&root) {
+                Ok(rel) => to_posix(rel),
+                Err(_) => to_posix(&path),
+            })
+            .collect();
+        if set.is_empty() {
+            let _ = write!(
+                out,
+                "{}",
+                format_report(&[], 0, options.threshold, &options.format)
+            );
+            let _ = writeln!(
+                err,
+                "[dryer] PASS (exit 0): 0 changed source files to focus (0 duplicates)."
+            );
+            return 0;
+        }
+        Some(set)
+    } else {
+        None
+    };
+
     let files = match select_files(&options) {
         Ok(files) => files,
         Err(git_err) => {
@@ -512,35 +639,6 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
             return git_err.code;
         }
     };
-    fn write_dryer_summary(
-        err: &mut dyn Write,
-        candidates: &[super::model::Duplicate],
-        entries_scanned: usize,
-        threshold: f64,
-    ) {
-        if candidates.is_empty() {
-            let _ = writeln!(
-                err,
-                "[dryer] PASS (exit 0): 0 duplicate pairs >= {threshold:.2} ({entries_scanned} forms scanned)."
-            );
-            return;
-        }
-        let count = candidates.len();
-        let pair_word = if count == 1 { "pair" } else { "pairs" };
-        if let Some(top) = candidates.iter().max_by(|a, b| a.score.total_cmp(&b.score)) {
-            let _ = writeln!(
-                err,
-                "[dryer] FOUND (exit 0, review required): {count} duplicate {pair_word} >= {threshold:.2} ({entries_scanned} forms scanned; top: score={:.2} {}:{}-{} <-> {}:{}-{}). Exit 0 does not mean clean; inspect stdout candidates.",
-                top.score,
-                top.left.file,
-                top.left.start_line,
-                top.left.end_line,
-                top.right.file,
-                top.right.start_line,
-                top.right.end_line,
-            );
-        }
-    }
 
     if files.is_empty() {
         if options.format == "json" {
@@ -557,7 +655,7 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
 
     let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
 
-    let (entries_scanned, candidates, warnings) = scan_and_find_duplicates_resolved(
+    let (entries_scanned, mut candidates, warnings) = scan_and_find_duplicates_resolved(
         &files,
         &root,
         options.min_lines,
@@ -567,6 +665,21 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
     );
     for warning in warnings {
         let _ = writeln!(err, "[dryer] WARN: {warning}");
+    }
+    if let Some(ref focused_rel) = focused_set {
+        let before = candidates.len();
+        candidates.retain(|dup| {
+            focused_rel.contains(&dup.left.file) || focused_rel.contains(&dup.right.file)
+        });
+        let excluded = before - candidates.len();
+        if excluded > 0 {
+            let pair_word = if excluded == 1 { "pair" } else { "pairs" };
+            let _ = writeln!(
+                err,
+                "[dryer] INFO (non-blocking): {excluded} unchanged legacy duplicate {pair_word} >= {:.2} excluded by --focus-changed.",
+                options.threshold
+            );
+        }
     }
     if options.no_metrics {
         let _ = write!(
@@ -1130,5 +1243,118 @@ mod tests {
         run_no_cache_subproc_case(Some("1"), "env_1");
         run_no_cache_subproc_case(None, "cli_flag");
         run_no_cache_subproc_case(None, "warm_cli");
+    }
+
+    #[test]
+    fn focus_changed_and_base_options_validate_and_filter_untouched_legacy_duplicates() {
+        let help = help_text();
+        assert!(help.contains("--focus-changed"));
+        assert!(help.contains("--base <ref>"));
+
+        let focus = parse_args(&s(&["--focus-changed"]));
+        assert_eq!(focus.action, Action::Scan);
+        assert!(focus.focus_changed);
+        assert!(focus.no_metrics);
+
+        let base_alone = parse_args(&s(&["--base", "main"]));
+        assert_eq!(base_alone.exit_code, 1);
+        assert!(
+            base_alone
+                .message
+                .contains("--base requires --changed or --focus-changed")
+        );
+
+        let both = parse_args(&s(&["--changed", "--focus-changed"]));
+        assert_eq!(both.exit_code, 1);
+        assert!(
+            both.message
+                .contains("--changed cannot be combined with --focus-changed")
+        );
+
+        let base = std::env::temp_dir().join(format!("dryer-focus-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let guard = TempDirGuard(base.clone());
+        let repo = &guard.0;
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "dev@example.com"]);
+        git(&["config", "user.name", "Dev"]);
+
+        let legacy_body = "def legacy_dup(x, y):\n    total = x + y\n    if total > 5:\n        return total * 2\n    return total\n";
+        let shared_body = "def existing_helper(a, b):\n    summed = a + b\n    if summed > 10:\n        return summed + 3\n    return summed\n";
+        std::fs::write(repo.join("src/legacy_a.py"), legacy_body).unwrap();
+        std::fs::write(
+            repo.join("src/legacy_b.py"),
+            legacy_body.replace("legacy_dup", "legacy_dup_two"),
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/base.py"), shared_body).unwrap();
+        std::fs::write(repo.join("src/clean.py"), "def ok():\n    return 1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "initial"]);
+
+        // Add an untracked file copying unchanged `src/base.py`.
+        std::fs::write(
+            repo.join("src/new_copy.py"),
+            shared_body.replace("existing_helper", "copied_helper"),
+        )
+        .unwrap();
+
+        // Plain `--changed` misses cross-file duplication against unchanged `src/base.py`.
+        let (changed_code, changed_out, _) =
+            run_fixture_scan(repo, &["--changed", "--json", "--no-metrics"]);
+        assert_eq!(changed_code, 0);
+        let changed_val: serde_json::Value = serde_json::from_str(&changed_out).unwrap();
+        assert_eq!(changed_val["summary"]["duplicates"], 0);
+
+        // `--focus-changed` finds `(src/base.py, src/new_copy.py)`, excludes the untouched legacy pair,
+        // and implicitly skips writing `.metrics/dry.edn`.
+        let (focus_code, focus_out, focus_err) =
+            run_fixture_scan(repo, &["--focus-changed", "--json"]);
+        assert_eq!(focus_code, 0);
+        assert!(!repo.join(".metrics").exists());
+        assert!(
+            focus_err.contains("[dryer] INFO (non-blocking): 1 unchanged legacy duplicate pair"),
+            "stderr was: {focus_err}"
+        );
+        assert!(
+            focus_err.contains("[dryer] FOUND (exit 0, review required): 1 duplicate pair"),
+            "stderr was: {focus_err}"
+        );
+        let focus_val: serde_json::Value = serde_json::from_str(&focus_out).unwrap();
+        assert_eq!(focus_val["summary"]["duplicates"], 1);
+        let pair = &focus_val["candidates"][0];
+        let files = [
+            pair["left"]["file"].as_str().unwrap(),
+            pair["right"]["file"].as_str().unwrap(),
+        ];
+        assert!(files.contains(&"src/base.py"));
+        assert!(files.contains(&"src/new_copy.py"));
+
+        // Commit `src/new_copy.py` and verify `--focus-changed --base HEAD~1` still isolates that pair.
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "add copy"]);
+        let (base_code, base_out, base_err) =
+            run_fixture_scan(repo, &["--focus-changed", "--base", "HEAD~1", "--json"]);
+        assert_eq!(base_code, 0);
+        assert!(
+            base_err.contains("[dryer] INFO (non-blocking): 1 unchanged legacy duplicate pair")
+        );
+        let base_val: serde_json::Value = serde_json::from_str(&base_out).unwrap();
+        assert_eq!(base_val["summary"]["duplicates"], 1);
     }
 }

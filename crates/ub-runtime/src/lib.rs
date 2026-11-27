@@ -2,6 +2,7 @@
 
 mod atomic;
 mod cache;
+mod git;
 mod lock;
 mod priority;
 mod runtime;
@@ -11,6 +12,7 @@ pub use cache::{
     CacheDecoder, CacheEncoder, FileStamp, ManifestStampCache, cache_dir, env_no_cache,
     file_mtime_size, load_cache_file, repo_cache_path, save_cache_file,
 };
+pub use git::{ChangedLines, GitCommandError, git_changed_lines, parse_diff_line_ranges, run_git};
 pub use lock::{
     LockGuard, acquire_global_scan_slot, acquire_global_scan_slot_in, acquire_repo_lock,
     acquire_repo_lock_in, acquire_repo_shared_lock, acquire_repo_shared_lock_in,

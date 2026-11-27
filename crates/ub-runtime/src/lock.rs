@@ -64,7 +64,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     }
 }
 
-fn normalize_repo_path(root: &Path) -> PathBuf {
+pub(crate) fn normalize_repo_path(root: &Path) -> PathBuf {
     if let Ok(canon) = fs::canonicalize(root) {
         return strip_verbatim(canon);
     }

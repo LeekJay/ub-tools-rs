@@ -24,7 +24,8 @@ fn run_mutator(cwd: &Path, cache_dir: &Path, args: &[&str], extra_envs: &[(&str,
     cmd.args(args)
         .current_dir(cwd)
         .env("UB_TOOLS_CACHE_DIR", cache_dir)
-        .env_remove("UB_TOOLS_NO_CACHE");
+        .env_remove("UB_TOOLS_NO_CACHE")
+        .env_remove("UB_TOOLS_NO_METRICS");
     for (k, v) in extra_envs {
         cmd.env(k, v);
     }
@@ -348,4 +349,182 @@ fn json_outputs_empty_scan_and_mutate_exit_codes_cleanly() {
     assert_eq!(base_val["mode"], "mutate");
     assert_eq!(base_val["summary"]["baseline_failed"], true);
     assert_eq!(base_val["summary"]["score"], serde_json::Value::Null);
+}
+
+#[test]
+fn no_metrics_and_this_run_vs_carried_forward_work_as_designed() {
+    let repo = TempDirGuard::new("mutator_it_no_metrics_split");
+    let cache_dir = TempDirGuard::new("mutator_it_nm_cache");
+    let root = &repo.0;
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/demo.py"),
+        "def add(a, b):\n    if a > 0:\n        return a + b\n    return 0\n",
+    )
+    .unwrap();
+
+    let py = python_bin();
+    let pass_cmd = format!(
+        "{py} -c \"import sys; sys.path.insert(0, 'src'); from demo import add; raise SystemExit(0 if add(2, 3) == 5 else 1)\""
+    );
+
+    // 1. `--no-metrics` executes mutants without creating `.metrics/mutate` or emitting `Wrote`.
+    let no_metrics = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--mutate-all",
+            "--no-metrics",
+            "--lines",
+            "3",
+            "--max-workers",
+            "1",
+            "--json",
+            "--test-command",
+            &pass_cmd,
+            "src/demo.py",
+        ],
+        &[],
+    );
+    assert_eq!(no_metrics.status.code(), Some(0));
+    assert!(!root.join(".metrics").exists());
+    let nm_stderr = String::from_utf8_lossy(&no_metrics.stderr);
+    assert!(!nm_stderr.contains("Wrote "));
+    let nm_val: serde_json::Value = serde_json::from_slice(&no_metrics.stdout).unwrap();
+    assert_eq!(nm_val["written"], serde_json::json!([]));
+    assert!(nm_val["summary"]["executed_killed"].as_u64().unwrap() >= 1);
+    assert_eq!(nm_val["summary"]["executed_survived"], 0);
+
+    // 2. Full file run records survivor(s) on line 2 into `.metrics/mutate/*.edn`.
+    let full = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--mutate-all",
+            "--max-workers",
+            "1",
+            "--json",
+            "--test-command",
+            &pass_cmd,
+            "src/demo.py",
+        ],
+        &[],
+    );
+    assert_eq!(full.status.code(), Some(3));
+    assert!(root.join(".metrics").join("mutate").exists());
+
+    // 3. Targeted re-run on line 3 kills all executed sites (`executed_survived == 0`), while carried-forward
+    // survivor(s) cause exit 3 and are clearly separated in stderr and JSON summary.
+    let targeted = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--mutate-all",
+            "--lines",
+            "3",
+            "--max-workers",
+            "1",
+            "--json",
+            "--test-command",
+            &pass_cmd,
+            "src/demo.py",
+        ],
+        &[],
+    );
+    assert_eq!(targeted.status.code(), Some(3));
+    let tgt_stderr = String::from_utf8_lossy(&targeted.stderr);
+    assert!(
+        tgt_stderr.contains("this run killed"),
+        "stderr: {tgt_stderr}"
+    );
+    assert!(
+        tgt_stderr.contains("carried-forward"),
+        "stderr: {tgt_stderr}"
+    );
+    let tgt_val: serde_json::Value = serde_json::from_slice(&targeted.stdout).unwrap();
+    assert!(tgt_val["summary"]["executed_killed"].as_u64().unwrap() >= 1);
+    assert_eq!(tgt_val["summary"]["executed_survived"], 0);
+    assert!(tgt_val["summary"]["survived"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn changed_lines_and_base_scope_scan_and_mutate_to_git_hunks() {
+    fn git(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let repo = TempDirGuard::new("mutator_it_changed_lines");
+    let cache_dir = TempDirGuard::new("mutator_it_cl_cache");
+    let root = &repo.0;
+    git(root, &["init"]);
+    git(root, &["config", "user.name", "Mutator Test"]);
+    git(root, &["config", "user.email", "mutator@example.com"]);
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/demo.py"),
+        "def calc(a, b):\n    if a > 0:\n        return a + b\n    return 0\n",
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-m", "initial"]);
+
+    // Edit only line 3 (`return a + b` -> `return a + b + 1`).
+    fs::write(
+        root.join("src/demo.py"),
+        "def calc(a, b):\n    if a > 0:\n        return a + b + 1\n    return 0\n",
+    )
+    .unwrap();
+
+    let scan_changed = run_mutator(
+        root,
+        &cache_dir.0,
+        &["--scan", "--no-coverage", "--changed-lines", "--json"],
+        &[],
+    );
+    assert_eq!(scan_changed.status.code(), Some(0));
+    assert!(scan_changed.stderr.is_empty());
+    let scan_val: serde_json::Value = serde_json::from_slice(&scan_changed.stdout).unwrap();
+    let sites = scan_val["files"][0]["sites"].as_array().unwrap();
+    assert!(!sites.is_empty());
+    assert!(sites.iter().all(|s| s["line"] == 3), "sites: {sites:?}");
+
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-m", "edit line 3"]);
+
+    let scan_base = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--scan",
+            "--no-coverage",
+            "--changed-lines",
+            "--base",
+            "HEAD~1",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(scan_base.status.code(), Some(0));
+    assert!(scan_base.stderr.is_empty());
+    let base_val: serde_json::Value = serde_json::from_slice(&scan_base.stdout).unwrap();
+    let base_sites = base_val["files"][0]["sites"].as_array().unwrap();
+    assert!(!base_sites.is_empty());
+    assert!(
+        base_sites.iter().all(|s| s["line"] == 3),
+        "base_sites: {base_sites:?}"
+    );
 }

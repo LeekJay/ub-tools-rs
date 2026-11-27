@@ -406,6 +406,7 @@ pub struct MutateOptions<'a> {
     pub max_workers: Option<usize>,
     pub xcode_scheme: Option<&'a str>,
     pub xcode_destination: Option<&'a str>,
+    pub no_metrics: bool,
 }
 
 /// Options for scanning mutation sites in a single file.
@@ -626,6 +627,16 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
         }
     }
 
+    let mut executed_killed = 0usize;
+    let mut executed_survived = 0usize;
+    for site in &selected {
+        match outcomes.get(&site.mutation_id).map(String::as_str) {
+            Some("killed") => executed_killed += 1,
+            Some("survived") => executed_survived += 1,
+            _ => {}
+        }
+    }
+
     let summary_input = FormSummaryInput {
         source: &source,
         path: &path,
@@ -637,15 +648,19 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
         lines: opts.lines,
     };
     let forms = build_forms(&summary_input, provider);
-    let written = match write_results(&root, &file_key, &forms, &outcomes) {
-        Ok(paths) => paths.into_iter().map(|p| to_posix(&p)).collect(),
-        Err(err) => {
-            return RunResult {
-                path: file_key,
-                baseline_failed: true,
-                baseline_message: format!("Failed to write metrics: {err}"),
-                ..Default::default()
-            };
+    let written = if opts.no_metrics {
+        Vec::new()
+    } else {
+        match write_results(&root, &file_key, &forms, &outcomes) {
+            Ok(paths) => paths.into_iter().map(|p| to_posix(&p)).collect(),
+            Err(err) => {
+                return RunResult {
+                    path: file_key,
+                    baseline_failed: true,
+                    baseline_message: format!("Failed to write metrics: {err}"),
+                    ..Default::default()
+                };
+            }
         }
     };
     restore_if_dirty(&path, &original);
@@ -655,6 +670,8 @@ fn mutate_file_impl<R: Runner + Sync, E: EngineProvider>(
         forms,
         written,
         statuses: statuses(&found, &covered, &outcomes),
+        executed_killed,
+        executed_survived,
         sites: found,
         ..Default::default()
     }
@@ -1215,6 +1232,7 @@ mod tests {
             max_workers: Some(1),
             xcode_scheme: None,
             xcode_destination: None,
+            no_metrics: false,
         };
         let res = mutate_file_cached_with_history(
             &file,

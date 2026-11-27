@@ -22,8 +22,8 @@ Modeled on [unclebob/ub-mode](https://github.com/unclebob/ub-mode) and loosely b
 | Tool | Local Crate | Configured Flags in `SKILL.md` | Upstream |
 | --- | --- | --- | --- |
 | `crapper` | [`crates/crapper`](../../crates/crapper) | `--changed-functions --json` (implies `--no-metrics`, optional `--base <ref>`, surfaces legacy debt on `stderr`) | [unclebob/crapper](https://github.com/unclebob/crapper) |
-| `dryer` | [`crates/dryer`](../../crates/dryer) | `--threshold 0.8 --json`, `--no-metrics` for intermediate checks | [unclebob/dryer](https://github.com/unclebob/dryer) |
-| `mutator` | [`crates/mutator`](../../crates/mutator) | `--scan --json` first to filter out non-decision lines, then `--json` with `--lines` and scoped `--test-command` for slow runners | [unclebob/mutator](https://github.com/unclebob/mutator) |
+| `dryer` | [`crates/dryer`](../../crates/dryer) | `--focus-changed --threshold 0.8 --json` (implies `--no-metrics`, optional `--base <ref>`) | [unclebob/dryer](https://github.com/unclebob/dryer) |
+| `mutator` | [`crates/mutator`](../../crates/mutator) | `--scan --changed-lines --json` first to filter out non-decision lines, then `--json` with `--lines`, scoped `--test-command`, and optional `--no-metrics` | [unclebob/mutator](https://github.com/unclebob/mutator) |
 | `uml-viewer` | External companion | Visualizes `.metrics/` components, coverage, CRAP, mutation scores, and dependencies | [unclebob/uml-viewer](https://github.com/unclebob/uml-viewer) |
 
 ## Installation

@@ -113,11 +113,11 @@ Every time you are asked to make a change follow:
 
 ## Dryer
 
-* Use the dryer tool (`--threshold 0.8 --json`, adding `--no-metrics` during intermediate checks) to eliminate duplication that ranks 0.8 or above.
+* Use the dryer tool (`--focus-changed --threshold 0.8 --json`, adding `--base <ref>` for committed branch diffs; implies `--no-metrics` while still scanning full target scope and focusing output on changed files; omit `--focus-changed` for full-repo audits) to eliminate duplication that ranks 0.8 or above.
 
 ## Mutator
 
-* Use the mutator tool (run `--scan --json` first to inspect sites, exclude logging, telemetry, and non-decision boilerplate, then pass `--json` with `--lines` targeting only changed branch and decision logic).
+* Use the mutator tool (run `--scan --changed-lines --json` first to inspect touched sites, adding `--base <ref>` for committed diffs, exclude logging, telemetry, and non-decision boilerplate, then pass `--json` with `--lines` targeting only changed branch and decision logic; add `--no-metrics` for read-only intermediate checks).
 * When the default test suite is slow, pass `--test-command` scoped to the matching unit test file; if high-risk sites exceed a ~2 to 3 minute batch (`selected_sites * single_run_seconds / workers`), split them into sequential `--lines` batches rather than skipping risky branches or weakening assertions.
 * Cover the uncovered.
 * Kill the survivors.

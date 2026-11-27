@@ -178,6 +178,8 @@ pub struct MutateReport<'a> {
     pub sites: &'a [MutateSite],
     pub written: &'a [String],
     pub skipped: &'a [SkippedFile],
+    pub executed_killed: usize,
+    pub executed_survived: usize,
     pub baseline_failed: bool,
 }
 
@@ -279,6 +281,8 @@ pub fn format_scan_json(files: &[ScanFileData]) -> String {
 struct MutateSummaryJson {
     killed: usize,
     survived: usize,
+    executed_killed: usize,
+    executed_survived: usize,
     uncovered: usize,
     sites: usize,
     score: Option<f64>,
@@ -337,6 +341,8 @@ pub fn format_mutate_json(report: &MutateReport<'_>) -> String {
         summary: MutateSummaryJson {
             killed,
             survived,
+            executed_killed: report.executed_killed,
+            executed_survived: report.executed_survived,
             uncovered,
             sites: total_sites,
             score,
@@ -528,6 +534,8 @@ mod tests {
             serde_json::json!({
                 "killed": 0,
                 "survived": 0,
+                "executed_killed": 0,
+                "executed_survived": 0,
                 "uncovered": 0,
                 "sites": 0,
                 "score": null,
@@ -564,12 +572,16 @@ mod tests {
             sites: &sites,
             written: &written,
             skipped: &skipped,
+            executed_killed: 1,
+            executed_survived: 0,
             baseline_failed: true,
         });
         assert!(out.ends_with('\n'));
         let val: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(val["summary"]["killed"], 1);
         assert_eq!(val["summary"]["survived"], 1);
+        assert_eq!(val["summary"]["executed_killed"], 1);
+        assert_eq!(val["summary"]["executed_survived"], 0);
         assert_eq!(val["summary"]["uncovered"], 1);
         assert_eq!(val["summary"]["sites"], 3);
         assert_eq!(val["summary"]["score"], 0.5);

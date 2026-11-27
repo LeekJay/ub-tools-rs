@@ -1,6 +1,7 @@
 //! Command line for the multi-language mutation tool.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufWriter, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use regex::Regex;
-use ub_runtime::{FileStamp, ManifestStampCache};
+use ub_runtime::{ChangedLines, FileStamp, ManifestStampCache};
 
 use crate::cache::{CachedSites, SiteCache, file_stamp, repo_cache_path};
 use crate::engine::{
@@ -63,6 +64,10 @@ Options:
                                 May be repeated.
   --changed                     Mutate added and modified source files from
                                 git status.
+  --changed-lines               Mutate or scan only lines touched by git diff
+                                (plus all lines in untracked new files).
+  --base <ref>                  Git base ref for --changed or --changed-lines
+                                (compares <ref> against working tree).
   --scan                        List mutation sites. Do not run tests or
                                 write metrics.
   --mutate-all                  Run every covered site, including ones the
@@ -96,6 +101,7 @@ Options:
                                 number of selected sites.
   --verbose                     Print each test command and each mutant.
   --json                        Emit machine-readable JSON output.
+  --no-metrics                  Skip writing .metrics/mutate snapshots.
   --no-cache                    Bypass and do not update the site cache.
 
 Arguments:
@@ -190,8 +196,11 @@ pub struct Options {
     pub mutation_warning: i64,
     pub max_workers: Option<usize>,
     pub changed: bool,
+    pub changed_lines: bool,
+    pub base: Option<String>,
     pub verbose: bool,
     pub json: bool,
+    pub no_metrics: bool,
     pub no_cache: bool,
 }
 
@@ -218,8 +227,11 @@ impl Default for Options {
             mutation_warning: 50,
             max_workers: None,
             changed: false,
+            changed_lines: false,
+            base: None,
             verbose: false,
             json: false,
+            no_metrics: false,
             no_cache: false,
         }
     }
@@ -459,6 +471,14 @@ pub fn parse_args_with_help(args: &[String], help: &str) -> Options {
                     options.changed = true;
                     index += 1;
                 }
+                "--changed-lines" => {
+                    options.changed_lines = true;
+                    index += 1;
+                }
+                "--base" => {
+                    options.base = Some(take(args, index, arg)?.to_string());
+                    index += 2;
+                }
                 "--scan" => {
                     options.scan = true;
                     index += 1;
@@ -477,6 +497,10 @@ pub fn parse_args_with_help(args: &[String], help: &str) -> Options {
                 }
                 "--json" => {
                     options.json = true;
+                    index += 1;
+                }
+                "--no-metrics" => {
+                    options.no_metrics = true;
                     index += 1;
                 }
                 "--no-cache" => {
@@ -516,6 +540,13 @@ pub fn parse_args_with_help(args: &[String], help: &str) -> Options {
     if options.scan && options.max_workers.is_some() {
         return help_error("--scan cannot be combined with --max-workers", help);
     }
+    if options.base.is_some() && !options.changed && !options.changed_lines {
+        return help_error("--base requires --changed or --changed-lines", help);
+    }
+    if options.changed_lines && options.lines.is_some() {
+        return help_error("--changed-lines cannot be combined with --lines", help);
+    }
+    options.no_metrics = options.no_metrics || ub_runtime::env_no_metrics();
     options.no_cache = options.no_cache || ub_runtime::env_no_cache();
     options
 }
@@ -524,6 +555,15 @@ pub fn parse_args_with_help(args: &[String], help: &str) -> Options {
 pub struct GitStatusError {
     pub code: i32,
     pub message: String,
+}
+
+impl From<ub_runtime::GitCommandError> for GitStatusError {
+    fn from(err: ub_runtime::GitCommandError) -> Self {
+        Self {
+            code: err.code,
+            message: err.message,
+        }
+    }
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> Result<Vec<u8>, GitStatusError> {
@@ -693,13 +733,59 @@ fn inside_root(files: Vec<PathBuf>, root: &Path) -> Vec<PathBuf> {
     inside
 }
 
-/// Select sorted mutable source files under `options.project_root`.
-pub fn select_files_with<D: DiscoverProvider>(
+struct FileSelection {
+    files: Vec<PathBuf>,
+    changed_lines: Option<HashMap<String, ChangedLines>>,
+}
+
+fn resolve_selection_with<D: DiscoverProvider>(
     options: &Options,
     discover: &D,
-) -> Result<Vec<PathBuf>, GitStatusError> {
+) -> Result<FileSelection, GitStatusError> {
     let root = resolve_path(&options.project_root);
     let (existing, filters) = split_positionals(&root, &options.positionals);
+    if options.changed_lines || (options.changed && options.base.is_some()) {
+        let scope = ub_runtime::git_changed_lines(&root, options.base.as_deref())?;
+        let mut raw_map: HashMap<String, ChangedLines> = HashMap::with_capacity(scope.len());
+        let mut candidates = Vec::with_capacity(scope.len());
+        for (path, lines) in scope {
+            if !is_mutable_source(&path, &root, discover) {
+                continue;
+            }
+            if !existing.is_empty() && !existing.iter().any(|e| path == *e || path.starts_with(e)) {
+                continue;
+            }
+            if options.changed_lines {
+                raw_map.insert(to_posix(&path), lines);
+            }
+            candidates.push(path);
+        }
+        let matched = matching_filters(candidates, &filters);
+        let inside = inside_root(matched, &root);
+        let mut deduped: Vec<(String, PathBuf)> =
+            inside.into_iter().map(|p| (to_posix(&p), p)).collect();
+        deduped.sort_by(|a, b| a.0.cmp(&b.0));
+        deduped.dedup_by(|a, b| a.0 == b.0);
+        let files: Vec<PathBuf> = deduped.into_iter().map(|(_, p)| p).collect();
+        let changed_lines = if options.changed_lines {
+            let mut by_key = HashMap::with_capacity(files.len());
+            for resolved in &files {
+                if let Some(lines) = raw_map.remove(&to_posix(resolved))
+                    && let Ok(key) = source_key_resolved(resolved, &root)
+                {
+                    by_key.insert(key, lines);
+                }
+            }
+            Some(by_key)
+        } else {
+            None
+        };
+        return Ok(FileSelection {
+            files,
+            changed_lines,
+        });
+    }
+
     let files = choose_files(options, &root, &existing, discover)?;
     let matched = matching_filters(files, &filters);
     let inside = inside_root(matched, &root);
@@ -707,7 +793,32 @@ pub fn select_files_with<D: DiscoverProvider>(
         inside.into_iter().map(|p| (to_posix(&p), p)).collect();
     deduped.sort_by(|a, b| a.0.cmp(&b.0));
     deduped.dedup_by(|a, b| a.0 == b.0);
-    Ok(deduped.into_iter().map(|(_, p)| p).collect())
+    Ok(FileSelection {
+        files: deduped.into_iter().map(|(_, p)| p).collect(),
+        changed_lines: None,
+    })
+}
+
+/// Select sorted mutable source files under `options.project_root`.
+pub fn select_files_with<D: DiscoverProvider>(
+    options: &Options,
+    discover: &D,
+) -> Result<Vec<PathBuf>, GitStatusError> {
+    resolve_selection_with(options, discover).map(|sel| sel.files)
+}
+
+fn effective_lines<'a>(
+    explicit_lines: Option<&'a HashSet<usize>>,
+    file_key: Option<&str>,
+    changed_lines: Option<&HashMap<String, ChangedLines>>,
+) -> Option<Cow<'a, HashSet<usize>>> {
+    if let Some(lines) = explicit_lines {
+        return Some(Cow::Borrowed(lines));
+    }
+    let map = changed_lines?;
+    let key = file_key?;
+    map.get(key)
+        .and_then(|changed| changed.to_line_set().map(Cow::Owned))
 }
 
 /// Abstraction for CLI execution dependencies (`crapper` coverage + engine).
@@ -891,6 +1002,7 @@ fn scan<P: CliProvider + Sync>(
     options: &Options,
     root: &Path,
     files: &[PathBuf],
+    changed_lines: Option<&HashMap<String, ChangedLines>>,
     provider: &P,
 ) -> i32 {
     let mut session = CacheSession::open(options.no_cache, root);
@@ -906,10 +1018,15 @@ fn scan<P: CliProvider + Sync>(
                 .as_deref()
                 .and_then(|key| history_index.get(key))
                 .unwrap_or(&empty_history);
+            let eff_lines = effective_lines(
+                options.lines.as_ref(),
+                lookup.file_key.as_deref(),
+                changed_lines,
+            );
             let scan_opts = ScanOptions {
                 covered_lines: cov.as_ref(),
                 ignore_coverage: options.no_coverage,
-                lines: options.lines.as_ref(),
+                lines: eff_lines.as_deref(),
                 cached_sites: lookup.cached_sites,
             };
             let outcome = match lookup.file_key.as_deref() {
@@ -969,6 +1086,8 @@ struct MutateAccumulator {
     sites: Vec<MutateSite>,
     written: Vec<String>,
     skipped: Vec<SkippedFile>,
+    executed_killed: usize,
+    executed_survived: usize,
     baseline_failed: bool,
     survived: bool,
 }
@@ -998,6 +1117,8 @@ fn record_result(result: RunResult, json: bool, acc: &mut MutateAccumulator) {
     if result.forms.iter().any(|f| f.survived > 0) {
         acc.survived = true;
     }
+    acc.executed_killed += result.executed_killed;
+    acc.executed_survived += result.executed_survived;
     acc.forms.extend(result.forms);
     acc.written.extend(result.written);
 }
@@ -1031,6 +1152,7 @@ fn mutate_files<P: CliProvider + Sync>(
     options: &Options,
     root: &Path,
     files: &[PathBuf],
+    changed_lines: Option<&HashMap<String, ChangedLines>>,
     provider: &P,
 ) -> i32 {
     let mut session = CacheSession::open(options.no_cache, root);
@@ -1046,18 +1168,6 @@ fn mutate_files<P: CliProvider + Sync>(
 
     for path in files {
         let cov = coverage_for(options, root, path, provider);
-        let opts = MutateOptions {
-            covered_lines: cov.as_ref(),
-            ignore_coverage: options.no_coverage,
-            mutate_all: options.mutate_all,
-            lines: options.lines.as_ref(),
-            test_command: options.test_command.as_deref(),
-            timeout_factor: options.timeout_factor,
-            mutation_warning: options.mutation_warning,
-            max_workers: options.max_workers,
-            xcode_scheme: options.xcode_scheme.as_deref(),
-            xcode_destination: options.xcode_destination.as_deref(),
-        };
         let (canonical_key, file_key, language, stamp, was_hit, result) = {
             let lookup = lookup_file_cache_resolved(&session, &mut manifests, path, root, provider);
             let history = lookup
@@ -1065,6 +1175,24 @@ fn mutate_files<P: CliProvider + Sync>(
                 .as_deref()
                 .and_then(|key| history_index.get(key))
                 .unwrap_or(&empty_history);
+            let eff_lines = effective_lines(
+                options.lines.as_ref(),
+                lookup.file_key.as_deref(),
+                changed_lines,
+            );
+            let opts = MutateOptions {
+                covered_lines: cov.as_ref(),
+                ignore_coverage: options.no_coverage,
+                mutate_all: options.mutate_all,
+                lines: eff_lines.as_deref(),
+                test_command: options.test_command.as_deref(),
+                timeout_factor: options.timeout_factor,
+                mutation_warning: options.mutation_warning,
+                max_workers: options.max_workers,
+                xcode_scheme: options.xcode_scheme.as_deref(),
+                xcode_destination: options.xcode_destination.as_deref(),
+                no_metrics: options.no_metrics,
+            };
             let result = mutate_file_cached_with_context(
                 path,
                 root,
@@ -1115,6 +1243,8 @@ fn mutate_files<P: CliProvider + Sync>(
             sites: &acc.sites,
             written: &acc.written,
             skipped: &acc.skipped,
+            executed_killed: acc.executed_killed,
+            executed_survived: acc.executed_survived,
             baseline_failed: acc.baseline_failed,
         };
         write_stdout_bytes(format_mutate_json(&report).as_bytes());
@@ -1122,32 +1252,46 @@ fn mutate_files<P: CliProvider + Sync>(
         write_stdout_bytes(format_results(&acc.forms).as_bytes());
     }
     log_written_paths(&acc.written, &mut std::io::stderr());
+    let run_killed = acc.executed_killed;
+    let run_survived = acc.executed_survived;
     let total_killed: usize = acc.forms.iter().map(|f| f.killed).sum();
     let total_survived: usize = acc.forms.iter().map(|f| f.survived).sum();
     let total_uncovered: usize = acc.forms.iter().map(|f| f.uncovered).sum();
+    let carried_survived = total_survived.saturating_sub(run_survived);
+    let carried_killed = total_killed.saturating_sub(run_killed);
+    let mutant_word = |n: usize| if n == 1 { "mutant" } else { "mutants" };
+
     if acc.baseline_failed {
         eprintln!(
             "[mutator] FAIL (exit 2): baseline tests failed before mutation. Fix failing tests first."
         );
     } else if acc.survived {
-        let word = if total_survived == 1 {
-            "mutant"
+        let run_word = mutant_word(run_survived);
+        let cf_word = mutant_word(carried_survived);
+        if run_survived == 0 && carried_survived > 0 {
+            let rk_word = mutant_word(run_killed);
+            eprintln!(
+                "[mutator] FAIL (exit 3): this run killed {run_killed}/{run_killed} executed {rk_word} (0 survived); {carried_survived} carried-forward {cf_word} from prior .metrics/mutate snapshots caused exit 3 (total: killed={total_killed}, survived={total_survived}, uncovered={total_uncovered})."
+            );
+        } else if carried_survived > 0 {
+            eprintln!(
+                "[mutator] FAIL (exit 3): this run had {run_survived} {run_word} survive (this run: killed={run_killed}, survived={run_survived}; plus {carried_survived} carried-forward {cf_word}; total: killed={total_killed}, survived={total_survived}, uncovered={total_uncovered}). Review survived sites for missing test assertions or dead code."
+            );
         } else {
-            "mutants"
-        };
-        eprintln!(
-            "[mutator] FAIL (exit 3): {total_survived} {word} survived (killed={total_killed}, survived={total_survived}, uncovered={total_uncovered}). Review survived sites for missing test assertions or dead code."
-        );
+            eprintln!(
+                "[mutator] FAIL (exit 3): {run_survived} {run_word} survived (killed={total_killed}, survived={total_survived}, uncovered={total_uncovered}). Review survived sites for missing test assertions or dead code."
+            );
+        }
     } else if total_killed == 0 && total_uncovered > 0 {
         eprintln!(
             "[mutator] WARN (exit 0): 0 mutants executed ({total_uncovered} uncovered). Generate coverage or pass --no-coverage before treating as PASS."
         );
+    } else if run_killed > 0 && carried_killed > 0 {
+        eprintln!(
+            "[mutator] PASS (exit 0): all {total_killed} tested mutants killed (this run: killed={run_killed}; carried-forward: killed={carried_killed}; uncovered={total_uncovered})."
+        );
     } else if total_killed > 0 {
-        let word = if total_killed == 1 {
-            "mutant"
-        } else {
-            "mutants"
-        };
+        let word = mutant_word(total_killed);
         eprintln!(
             "[mutator] PASS (exit 0): all {total_killed} tested {word} killed (uncovered={total_uncovered})."
         );
@@ -1165,13 +1309,15 @@ pub fn run_with<P: CliProvider + Sync>(args: &[String], provider: &P) -> i32 {
         return print_help(&options);
     }
     let root = resolve_path(&options.project_root);
-    let files = match select_files_with(&options, provider) {
-        Ok(f) => f,
+    let selection = match resolve_selection_with(&options, provider) {
+        Ok(s) => s,
         Err(err) => {
             eprintln!("{}", err.message);
             return err.code;
         }
     };
+    let files = selection.files;
+    let changed_lines = selection.changed_lines;
     if files.is_empty() {
         if options.json {
             if options.scan {
@@ -1186,7 +1332,7 @@ pub fn run_with<P: CliProvider + Sync>(args: &[String], provider: &P) -> i32 {
     }
     if options.scan {
         let _slot = ub_runtime::acquire_global_scan_slot().ok().flatten();
-        return scan(&options, &root, &files, provider);
+        return scan(&options, &root, &files, changed_lines.as_ref(), provider);
     }
     let _repo_lock = ub_runtime::acquire_repo_lock(
         "mutator",
@@ -1202,7 +1348,7 @@ pub fn run_with<P: CliProvider + Sync>(args: &[String], provider: &P) -> i32 {
     if coverage != 0 {
         return coverage;
     }
-    mutate_files(&options, &root, &files, provider)
+    mutate_files(&options, &root, &files, changed_lines.as_ref(), provider)
 }
 
 #[cfg(test)]
@@ -1258,6 +1404,25 @@ mod tests {
             parse_args_with_help(&s(&["--not-a-flag"]), &help).exit_code,
             1
         );
+        assert!(help.contains("--no-metrics"));
+        assert!(help.contains("--changed-lines"));
+        assert!(help.contains("--base <ref>"));
+        assert_eq!(
+            parse_args_with_help(&s(&["--base", "main"]), &help).exit_code,
+            1
+        );
+        assert_eq!(
+            parse_args_with_help(&s(&["--changed-lines", "--lines", "3"]), &help).exit_code,
+            1
+        );
+        let changed_lines_opt = parse_args_with_help(
+            &s(&["--changed-lines", "--base", "main", "--no-metrics"]),
+            &help,
+        );
+        assert_eq!(changed_lines_opt.exit_code, 0);
+        assert!(changed_lines_opt.changed_lines);
+        assert_eq!(changed_lines_opt.base.as_deref(), Some("main"));
+        assert!(changed_lines_opt.no_metrics);
 
         let big_workers =
             parse_args_with_help(&s(&["--max-workers", "18446744073709551616"]), &help);

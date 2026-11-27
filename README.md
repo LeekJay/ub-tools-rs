@@ -6,7 +6,7 @@ Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's qu
 
 ![Rust Edition 2024](https://img.shields.io/badge/Rust-Edition_2024-dea584?style=flat-square&logo=rust&logoColor=white)
 ![Unsafe Forbidden](https://img.shields.io/badge/unsafe-forbidden-2ea44f?style=flat-square)
-![Tests 155 Passing](https://img.shields.io/badge/tests-155_passing-2ea44f?style=flat-square)
+![Tests 159 Passing](https://img.shields.io/badge/tests-159_passing-2ea44f?style=flat-square)
 ![License 0BSD and MIT](https://img.shields.io/badge/license-0BSD_%2F_MIT-0969da?style=flat-square)
 
 [Quick Start](#quick-start) · [Workspace](#workspace) · [Agent Skills](#agent-skills) · [Safeguards](#safeguards) · [Benchmarks](#benchmarks) · [Configuration](#configuration)
@@ -43,8 +43,8 @@ Run read-only scoped checks from any project root with structured JSON output.
 
 ```sh
 crapper --no-metrics --json --changed-functions
-dryer --no-metrics --json --threshold 0.8
-mutator --scan --json --changed
+dryer --focus-changed --json --threshold 0.8
+mutator --scan --changed-lines --json
 ```
 
 ## Workspace
@@ -64,8 +64,8 @@ Bundled skills under `skills/` preconfigure AI coding agents to pass `--json`, `
 
 | Skill | Purpose | Default CLI Flags | License |
 | --- | --- | --- | --- |
-| [`skills/ub-mode/`](skills/ub-mode/README.md) | Incremental coding discipline across `crapper`, `dryer`, and `mutator` | `--changed-functions --json`, intermediate `--no-metrics`, `mutator --scan --json` | MIT ([LICENSE](skills/ub-mode/LICENSE)) |
-| [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) | Read-only quality verification after scoped code changes | `crapper --changed-functions --no-metrics --json`, `dryer --threshold 0.8`, `mutator --scan --json` | 0BSD ([LICENSE](LICENSE)) |
+| [`skills/ub-mode/`](skills/ub-mode/README.md) | Incremental coding discipline across `crapper`, `dryer`, and `mutator` | `--changed-functions`, `dryer --focus-changed`, `mutator --scan --changed-lines --json`, `--no-metrics` | MIT ([LICENSE](skills/ub-mode/LICENSE)) |
+| [`skills/ub-quality-gate/`](skills/ub-quality-gate/README.md) | Read-only quality verification after scoped code changes | `crapper --changed-functions --json`, `dryer --focus-changed --threshold 0.8`, `mutator --scan --changed-lines --no-metrics --json` | 0BSD ([LICENSE](LICENSE)) |
 
 Install both skills into your agent's skills directory (for example `~/.claude/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, `~/.gemini/skills/`, or `~/.grok/skills/`).
 
@@ -86,13 +86,13 @@ Copy-Item -Recurse skills\ub-mode, skills\ub-quality-gate "$HOME\.claude\skills\
 * **Bounded CPU pools** cap `rayon` threads at `min(6, cores/2)` (at least `1`) and `mutator` workers at `min(2, cores/4)` on Windows or `min(4, cores/4)` elsewhere (at least `1`).
 * **Cross-process scan slots** limit concurrent `crapper`, `dryer`, and `mutator --scan` runs to `2` global slots via OS locks under `ub-tools-locks/` in the system temp directory.
 * **Repository kernel locks and atomic `.edn` writes** serialize per-repo coverage runs, mutation runs, and `.metrics/mutate/*.edn` updates while staging writes in unique sibling temp files with Windows sharing retries.
-* **Report-only mode** via `--no-metrics` (or `UB_TOOLS_NO_METRICS`) prints `crapper` and `dryer` reports and preserves threshold exit codes without touching `.metrics/`.
+* **Report-only mode** via `--no-metrics` (or `UB_TOOLS_NO_METRICS`) prints `crapper`, `dryer`, and `mutator` reports and preserves exit codes without writing `.metrics/`. Also implied automatically by `crapper --changed-functions` and `dryer --focus-changed`.
 
 ### Incremental caching and JSON output
 
 * **Per-repository `UBC1` caches** store parsed AST complexity records in `crapper`, compact 128-bit truncated SHA-256 subtree fingerprint hashes in `dryer`, and discovered mutation sites in `mutator`, placed outside repositories under the cache directory.
 * **Stamps and zero-write warm hits** invalidate per file via `(mtime_ns, size)` plus nearest `go.mod`, `Cargo.toml`, and `Package.swift` manifest stamps in `crapper` and `mutator`; warm runs with zero misses skip rewriting cache files and keep exact stdout parity.
-* **Bypass, live progress, and JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`), stream `[mutator] START`, `[done/total]`, and `[mutator] DONE` progress plus unified `[crapper]`, `[dryer]`, and `[mutator]` `stderr` status verdicts, support function-level `crapper --changed-functions` (implicitly `--no-metrics`, optional `--base <ref>`), and emit versioned `v1` JSON on `stdout` (including `start_line` and `end_line` in `crapper`) via `--json` with matching exit codes.
+* **Bypass, diff scoping, and JSON** support `--no-cache` (or `UB_TOOLS_NO_CACHE=1`), stream `[mutator] START`, `[done/total]`, and `[mutator] DONE` progress plus unified `[crapper]`, `[dryer]`, and `[mutator]` `stderr` status verdicts (separating `this run` vs. `carried-forward` outcomes in `mutator`), support `git diff` scoping (`crapper --changed-functions`, `dryer --focus-changed`, `mutator --changed-lines`, all with optional `--base <ref>`), and emit versioned `v1` JSON on `stdout` via `--json` with matching exit codes.
 
 ### Core Rust optimizations
 
@@ -136,7 +136,7 @@ Measured on a static snapshot of a 3,522-file TypeScript monorepo (`src/domain` 
 | `UB_TOOLS_THREADS` | `min(6, cores/2)` | Override `rayon` global thread pool size (falls back to `RAYON_NUM_THREADS` when unset) |
 | `UB_TOOLS_MUTATOR_WORKERS` | `min(2, cores/4)` on Windows, `min(4, cores/4)` elsewhere | Override default `mutator` worker count when `--max-workers` is omitted |
 | `UB_TOOLS_MAX_CONCURRENT` | `2` | Global scan lock slots across `crapper`, `dryer`, and `mutator --scan` (`0` disables) |
-| `UB_TOOLS_NO_METRICS` | unset | Skip writing `.metrics/crap.edn` and `.metrics/dry.edn` when set to `1`, `true`, or `yes` |
+| `UB_TOOLS_NO_METRICS` | unset | Skip writing `.metrics/crap.edn`, `.metrics/dry.edn`, and `.metrics/mutate/*.edn` when set to `1`, `true`, or `yes` |
 | `UB_TOOLS_CACHE_DIR` | OS cache dir (`%LOCALAPPDATA%\ub-tools-cache` or `~/.cache/ub-tools-cache`) | Override directory storing per-repository `UBC1` incremental cache files |
 | `UB_TOOLS_NO_CACHE` | unset | Disable reading and writing `UBC1` incremental cache files when set to `1`, `true`, or `yes` |
 
