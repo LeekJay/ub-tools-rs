@@ -973,6 +973,42 @@ impl CoverageBundle {
         }
     }
 
+    /// Returns true if any loaded coverage report contains records for the given entry.
+    pub fn has_coverage_for_entry(
+        &self,
+        path: &str,
+        language: &str,
+        namespace: &str,
+        name: &str,
+    ) -> bool {
+        match language {
+            "java" => self.jacoco.as_ref().is_some_and(|classes| {
+                let exact = format!("{namespace}#{name}");
+                let ns_hash = format!("{namespace}#");
+                let ns_inner = format!("{namespace}$");
+                classes
+                    .keys()
+                    .any(|k| k == &exact || k.starts_with(&ns_hash) || k.starts_with(&ns_inner))
+            }),
+            "go" => self.go_profile.as_ref().is_some_and(|profile| {
+                if let Some(root) = &self.root {
+                    let resolved = resolve_path(&root.join(path));
+                    if let Some(import_name) = go_import_name(&resolved, root)
+                        && profile.contains_key(&import_name)
+                    {
+                        return true;
+                    }
+                }
+                lookup(profile, path, &self.source_parts).is_some()
+            }),
+            "swift" => lookup(&self.swift, path, &self.source_parts).is_some(),
+            _ => {
+                lookup(&self.form_html, path, &self.source_parts).is_some()
+                    || lookup(&self.lcov, path, &self.source_parts).is_some()
+            }
+        }
+    }
+
     fn java_percent(&self, function: &Function) -> Option<f64> {
         let classes = self.jacoco.as_ref()?;
         let mut names = Vec::new();
@@ -1120,6 +1156,14 @@ fn subdirs_1_and_2(root: &Path, tail: &[&str]) -> Vec<PathBuf> {
     paths
 }
 
+fn sort_paths_by_mtime_asc(paths: &mut [PathBuf]) {
+    paths.sort_by_key(|p| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+}
+
 fn merge_lcov(root: &Path) -> BTreeMap<String, FileCoverage> {
     let mut paths = Vec::new();
     collect_recursive_named(
@@ -1128,6 +1172,7 @@ fn merge_lcov(root: &Path) -> BTreeMap<String, FileCoverage> {
         &mut paths,
     );
     collect_recursive_named(&root.join("coverage"), "lcov.info", &mut paths);
+    sort_paths_by_mtime_asc(&mut paths);
     let mut merged = BTreeMap::new();
     for text in merge_texts(paths) {
         merged.extend(parse_lcov(&text));
@@ -1410,6 +1455,73 @@ mod tests {
         let loaded = load_lcov(&root);
         assert!(loaded.contains_key("kept.ts"));
         assert!(!loaded.contains_key("ignored.ts"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_lcov_prefers_newer_mtime_across_target_and_coverage_dirs() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("crapper_lcov_mtime_{}_{nanos}", std::process::id()));
+        let target_lcov = root
+            .join("target")
+            .join("coverage")
+            .join("ts")
+            .join("lcov.info");
+        let cov_lcov = root.join("coverage").join("lcov.info");
+        fs::create_dir_all(target_lcov.parent().unwrap()).unwrap();
+        fs::create_dir_all(cov_lcov.parent().unwrap()).unwrap();
+
+        fs::write(
+            &target_lcov,
+            "SF:src/shared.ts\nDA:1,1\nend_of_record\nSF:src/only_target.ts\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        fs::write(
+            &cov_lcov,
+            "SF:src/shared.ts\nDA:1,0\nend_of_record\nSF:src/only_cov.ts\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+
+        let older =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let newer =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_010_000);
+        let set_mtime = |p: &Path, t: std::time::SystemTime| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+
+        // 1. Newer `target/coverage/.../lcov.info` overrides stale `coverage/lcov.info` on shared files
+        //    while keeping disjoint records from both.
+        set_mtime(&cov_lcov, older);
+        set_mtime(&target_lcov, newer);
+        let loaded_target_wins = load_lcov(&root);
+        assert_eq!(
+            loaded_target_wins["src/shared.ts"].lines.get(&1),
+            Some(&(1, 1))
+        );
+        assert!(loaded_target_wins.contains_key("src/only_target.ts"));
+        assert!(loaded_target_wins.contains_key("src/only_cov.ts"));
+
+        // 2. Newer `coverage/lcov.info` overrides older `target/coverage/.../lcov.info`.
+        set_mtime(&target_lcov, older);
+        set_mtime(&cov_lcov, newer);
+        let loaded_cov_wins = load_lcov(&root);
+        assert_eq!(
+            loaded_cov_wins["src/shared.ts"].lines.get(&1),
+            Some(&(0, 1))
+        );
+        assert!(loaded_cov_wins.contains_key("src/only_target.ts"));
+        assert!(loaded_cov_wins.contains_key("src/only_cov.ts"));
+
         let _ = fs::remove_dir_all(&root);
     }
 }

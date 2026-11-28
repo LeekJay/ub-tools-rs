@@ -1039,6 +1039,7 @@ fn scan<P: CliProvider + Sync>(
         })
         .collect();
 
+    let line_scoped = options.changed_lines || options.lines.is_some();
     let mut scanned = Vec::with_capacity(results.len());
     let mut misses = Vec::new();
     let mut active_keys = HashSet::with_capacity(files.len());
@@ -1060,7 +1061,9 @@ fn scan<P: CliProvider + Sync>(
                         },
                     ));
                 }
-                scanned.push(data);
+                if !(line_scoped && data.sites.is_empty()) {
+                    scanned.push(data);
+                }
             }
             Err(err) => {
                 if !options.json {
@@ -1092,7 +1095,12 @@ struct MutateAccumulator {
     survived: bool,
 }
 
-fn record_result(result: RunResult, json: bool, acc: &mut MutateAccumulator) {
+fn record_result(
+    result: RunResult,
+    json: bool,
+    line_filter: Option<&HashSet<usize>>,
+    acc: &mut MutateAccumulator,
+) {
     if !result.skipped.is_empty() {
         eprintln!("Skipping {}: {}", result.path, result.skipped);
         acc.skipped.push(SkippedFile {
@@ -1106,20 +1114,60 @@ fn record_result(result: RunResult, json: bool, acc: &mut MutateAccumulator) {
         acc.baseline_failed = true;
         return;
     }
+    let scoped_forms: Option<HashSet<(String, String)>> = line_filter.map(|lines| {
+        result
+            .sites
+            .iter()
+            .filter(|site| lines.contains(&site.line))
+            .map(|site| (site.namespace.clone(), site.form_id.clone()))
+            .collect()
+    });
+    let keep_site = |site: &Site, status: Option<&str>| -> bool {
+        let Some(st) = status else {
+            return false;
+        };
+        match line_filter {
+            None => true,
+            Some(lines) => st != "uncovered" || lines.contains(&site.line),
+        }
+    };
     if json {
         for site in result.sites {
             let status = result.statuses.get(&site.mutation_id).cloned();
-            acc.sites.push(MutateSite { site, status });
+            if keep_site(&site, status.as_deref()) {
+                acc.sites.push(MutateSite { site, status });
+            }
         }
     } else {
-        print!("{}", format_site_log(&result.sites, &result.statuses));
+        let filtered_sites: Vec<Site> = if line_filter.is_some() {
+            result
+                .sites
+                .into_iter()
+                .filter(|site| {
+                    let st = result.statuses.get(&site.mutation_id).map(String::as_str);
+                    keep_site(site, st)
+                })
+                .collect()
+        } else {
+            result.sites
+        };
+        print!("{}", format_site_log(&filtered_sites, &result.statuses));
     }
     if result.forms.iter().any(|f| f.survived > 0) {
         acc.survived = true;
     }
     acc.executed_killed += result.executed_killed;
     acc.executed_survived += result.executed_survived;
-    acc.forms.extend(result.forms);
+    match scoped_forms {
+        Some(ref scoped) => {
+            acc.forms.extend(result.forms.into_iter().filter(|f| {
+                f.killed > 0
+                    || f.survived > 0
+                    || scoped.contains(&(f.namespace.clone(), f.id.clone()))
+            }));
+        }
+        None => acc.forms.extend(result.forms),
+    }
     acc.written.extend(result.written);
 }
 
@@ -1168,7 +1216,7 @@ fn mutate_files<P: CliProvider + Sync>(
 
     for path in files {
         let cov = coverage_for(options, root, path, provider);
-        let (canonical_key, file_key, language, stamp, was_hit, result) = {
+        let (canonical_key, file_key, language, stamp, was_hit, eff_lines, result) = {
             let lookup = lookup_file_cache_resolved(&session, &mut manifests, path, root, provider);
             let history = lookup
                 .file_key
@@ -1210,6 +1258,7 @@ fn mutate_files<P: CliProvider + Sync>(
                 lookup.language,
                 lookup.stamp,
                 lookup.cached_sites.is_some(),
+                eff_lines,
                 result,
             )
         };
@@ -1230,7 +1279,7 @@ fn mutate_files<P: CliProvider + Sync>(
                 },
             ));
         }
-        record_result(result, options.json, &mut acc);
+        record_result(result, options.json, eff_lines.as_deref(), &mut acc);
     }
 
     session.save_misses(misses, &active_keys);
@@ -1246,6 +1295,7 @@ fn mutate_files<P: CliProvider + Sync>(
             executed_killed: acc.executed_killed,
             executed_survived: acc.executed_survived,
             baseline_failed: acc.baseline_failed,
+            scoped: options.lines.is_some() || options.changed_lines,
         };
         write_stdout_bytes(format_mutate_json(&report).as_bytes());
     } else if !acc.forms.is_empty() {

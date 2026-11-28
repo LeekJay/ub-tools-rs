@@ -6,7 +6,7 @@ Parity-verified pure Rust rewrites (`#![forbid(unsafe_code)]`) of Uncle Bob's qu
 
 ![Rust Edition 2024](https://img.shields.io/badge/Rust-Edition_2024-dea584?style=flat-square&logo=rust&logoColor=white)
 ![Unsafe Forbidden](https://img.shields.io/badge/unsafe-forbidden-2ea44f?style=flat-square)
-![Tests 160 Passing](https://img.shields.io/badge/tests-160_passing-2ea44f?style=flat-square)
+![Tests 163 Passing](https://img.shields.io/badge/tests-163_passing-2ea44f?style=flat-square)
 ![License 0BSD and MIT](https://img.shields.io/badge/license-0BSD_%2F_MIT-0969da?style=flat-square)
 
 [Quick Start](#quick-start) · [Workspace](#workspace) · [Agent Skills](#agent-skills) · [Safeguards](#safeguards) · [Benchmarks](#benchmarks) · [Configuration](#configuration)

@@ -851,24 +851,32 @@ where
         found.retain(|s| line_filter.contains(&s.line));
     }
 
-    let covered = if !opts.ignore_coverage && opts.covered_lines.is_some() {
-        Some(coverage_map(
-            &found,
-            opts.covered_lines,
-            opts.ignore_coverage,
-        ))
+    let covered = if !opts.ignore_coverage {
+        Some(coverage_map(&found, opts.covered_lines, false))
     } else {
         None
     };
 
     let mut changed = HashSet::new();
-    if !history.forms.is_empty() {
+    let skip_changed_for_lines = opts.lines.is_some() && found.is_empty();
+    if !history.forms.is_empty() && !skip_changed_for_lines {
         let source = match source_opt {
             Some(s) => s,
             None => read_source(path)?,
         };
         let digests = provider.form_digests(&source, path, root);
+        let active_forms: Option<HashSet<(&str, &str)>> = opts.lines.map(|_| {
+            found
+                .iter()
+                .map(|s| (s.namespace.as_str(), s.form_id.as_str()))
+                .collect()
+        });
         for (key, digest) in &digests {
+            if let Some(ref active) = active_forms
+                && !active.contains(&(key.0.as_str(), key.1.as_str()))
+            {
+                continue;
+            }
             let same = history
                 .forms
                 .get(key)
@@ -1246,6 +1254,207 @@ mod tests {
         );
         assert_eq!(prov.sites_calls.get(), 1);
         assert_eq!(res.sites.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_marks_missing_coverage_uncovered_and_scopes_changed_forms_to_filtered_lines() {
+        use crate::model::PriorForm;
+        use std::cell::Cell;
+
+        struct TwoFormProvider {
+            digest_calls: Cell<usize>,
+        }
+        impl DiscoverProvider for TwoFormProvider {
+            fn language_of(&self, _path: &Path) -> Option<&'static str> {
+                Some("python")
+            }
+            fn is_test_filename(&self, _name: &str) -> bool {
+                false
+            }
+            fn skip_dirs(&self) -> &[&str] {
+                &[]
+            }
+            fn test_dirs(&self) -> &[&str] {
+                &[]
+            }
+        }
+        impl EngineProvider for TwoFormProvider {
+            fn sites_in_file(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+                file_key: &str,
+            ) -> Vec<Site> {
+                vec![
+                    Site {
+                        file: file_key.to_string(),
+                        namespace: "demo".to_string(),
+                        form_id: "defn/f".to_string(),
+                        name: "f".to_string(),
+                        line: 2,
+                        start: 10,
+                        end: 11,
+                        original: "+".to_string(),
+                        mutant: "-".to_string(),
+                        category: "arithmetic".to_string(),
+                        mutation_id: "m1".to_string(),
+                        anchor_line: 2,
+                    },
+                    Site {
+                        file: file_key.to_string(),
+                        namespace: "demo".to_string(),
+                        form_id: "defn/g".to_string(),
+                        name: "g".to_string(),
+                        line: 10,
+                        start: 40,
+                        end: 41,
+                        original: ">".to_string(),
+                        mutant: ">=".to_string(),
+                        category: "comparison".to_string(),
+                        mutation_id: "m2".to_string(),
+                        anchor_line: 10,
+                    },
+                ]
+            }
+            fn form_digests(
+                &self,
+                _source: &str,
+                _path: &Path,
+                _root: &Path,
+            ) -> HashMap<(String, String), String> {
+                self.digest_calls.set(self.digest_calls.get() + 1);
+                HashMap::from([
+                    (("demo".into(), "defn/f".into()), "new_f".into()),
+                    (("demo".into(), "defn/g".into()), "new_g".into()),
+                ])
+            }
+            fn form_spans(&self, _source: &str, _path: &Path, _root: &Path) -> FormSpanMap {
+                HashMap::new()
+            }
+            fn test_plan(
+                &self,
+                root: &Path,
+                _source: &Path,
+                _language: &str,
+                _override_cmd: Option<&str>,
+                _xcode_scheme: Option<&str>,
+                _xcode_destination: Option<&str>,
+            ) -> (Command, PathBuf) {
+                (Command::Argv(vec!["true".into()]), root.to_path_buf())
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("mutator_scan_cov_{}", uuid::Uuid::new_v4()));
+        let file = root.join("src").join("demo.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "def f(x):\n    return x + 1\n").unwrap();
+
+        let prov = TwoFormProvider {
+            digest_calls: Cell::new(0),
+        };
+        let mut prior = History::default();
+        prior.forms.insert(
+            ("demo".into(), "defn/f".into()),
+            PriorForm {
+                namespace: "demo".into(),
+                id: "defn/f".into(),
+                digest: "old_f".into(),
+                file: "src/demo.py".into(),
+            },
+        );
+        prior.forms.insert(
+            ("demo".into(), "defn/g".into()),
+            PriorForm {
+                namespace: "demo".into(),
+                id: "defn/g".into(),
+                digest: "old_g".into(),
+                file: "src/demo.py".into(),
+            },
+        );
+
+        // 1. Coverage enabled with absent file (`covered_lines: None`) marks every site uncovered.
+        let missing_cov = scan_file_core(
+            &file,
+            &root,
+            &ScanOptions {
+                covered_lines: None,
+                ignore_coverage: false,
+                lines: None,
+                cached_sites: None,
+            },
+            Some(&prior),
+            false,
+            &prov,
+            read_utf8_source,
+        )
+        .unwrap();
+        assert_eq!(
+            missing_cov.covered,
+            Some(HashMap::from([
+                ("m1".to_string(), false),
+                ("m2".to_string(), false),
+            ]))
+        );
+        let text = format_scan(
+            &missing_cov.file,
+            &missing_cov.sites,
+            &missing_cov.changed,
+            missing_cov.covered.as_ref(),
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.contains(" uncovered")).count(),
+            2,
+            "expected uncovered label on all sites:\n{text}"
+        );
+        assert_eq!(prov.digest_calls.get(), 1);
+
+        // 2. Line filter `{2}` restricts `changed` forms to `defn/f` (excluding untouched `defn/g`).
+        let line_two = HashSet::from([2usize]);
+        let scoped = scan_file_core(
+            &file,
+            &root,
+            &ScanOptions {
+                covered_lines: None,
+                ignore_coverage: true,
+                lines: Some(&line_two),
+                cached_sites: None,
+            },
+            Some(&prior),
+            false,
+            &prov,
+            read_utf8_source,
+        )
+        .unwrap();
+        assert_eq!(scoped.sites.len(), 1);
+        assert_eq!(
+            scoped.changed,
+            HashSet::from([("demo".to_string(), "defn/f".to_string())])
+        );
+        assert_eq!(prov.digest_calls.get(), 2);
+
+        // 3. Empty line filter skips `form_digests` and returns empty `changed`.
+        let empty_line = HashSet::from([99usize]);
+        let no_sites = scan_file_core(
+            &file,
+            &root,
+            &ScanOptions {
+                covered_lines: None,
+                ignore_coverage: true,
+                lines: Some(&empty_line),
+                cached_sites: None,
+            },
+            Some(&prior),
+            false,
+            &prov,
+            read_utf8_source,
+        )
+        .unwrap();
+        assert!(no_sites.sites.is_empty());
+        assert!(no_sites.changed.is_empty());
+        assert_eq!(prov.digest_calls.get(), 2);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

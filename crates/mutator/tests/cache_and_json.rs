@@ -395,6 +395,18 @@ fn no_metrics_and_this_run_vs_carried_forward_work_as_designed() {
     assert_eq!(nm_val["written"], serde_json::json!([]));
     assert!(nm_val["summary"]["executed_killed"].as_u64().unwrap() >= 1);
     assert_eq!(nm_val["summary"]["executed_survived"], 0);
+    let nm_sites = nm_val["sites"].as_array().unwrap();
+    assert!(!nm_sites.is_empty());
+    assert_eq!(
+        nm_val["summary"]["sites"].as_u64().unwrap() as usize,
+        nm_sites.len()
+    );
+    assert!(
+        nm_sites
+            .iter()
+            .all(|s| s["line"] == 3 && !s["status"].is_null()),
+        "line-scoped JSON must not emit status: null or off-line sites: {nm_sites:?}"
+    );
 
     // 2. Full file run records survivor(s) on line 2 into `.metrics/mutate/*.edn`.
     let full = run_mutator(
@@ -526,5 +538,152 @@ fn changed_lines_and_base_scope_scan_and_mutate_to_git_hunks() {
     assert!(
         base_sites.iter().all(|s| s["line"] == 3),
         "base_sites: {base_sites:?}"
+    );
+}
+
+#[test]
+fn changed_lines_scan_drops_zero_site_files_and_marks_missing_lcov_uncovered() {
+    fn git(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let repo = TempDirGuard::new("mutator_it_scan_compact");
+    let cache_dir = TempDirGuard::new("mutator_it_scan_compact_cache");
+    let root = &repo.0;
+    git(root, &["init"]);
+    git(root, &["config", "user.name", "Mutator Test"]);
+    git(root, &["config", "user.email", "mutator@example.com"]);
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("coverage")).unwrap();
+    fs::write(
+        root.join("src/active.py"),
+        "def first(x):\n    if x > 0:\n        return x + 1\n    return 0\n\ndef second(y):\n    return y * 2\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/comment_only.py"),
+        "# old comment\ndef keep(z):\n    return z + 1\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("coverage/lcov.info"),
+        "SF:src/unrelated.py\nDA:1,1\nend_of_record\n",
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-m", "initial"]);
+
+    // Modify line 3 of `src/active.py` (mutable) and line 1 comment of `src/comment_only.py` (0 mutable sites).
+    fs::write(
+        root.join("src/active.py"),
+        "def first(x):\n    if x > 0:\n        return x + 2\n    return 0\n\ndef second(y):\n    return y * 2\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/comment_only.py"),
+        "# new comment\ndef keep(z):\n    return z + 1\n",
+    )
+    .unwrap();
+
+    let scan_json = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--scan",
+            "--changed-lines",
+            "--use-existing-coverage",
+            "--json",
+        ],
+        &[],
+    );
+    assert_eq!(scan_json.status.code(), Some(0));
+    assert!(scan_json.stderr.is_empty());
+    let scan_val: serde_json::Value = serde_json::from_slice(&scan_json.stdout).unwrap();
+    assert_eq!(scan_val["summary"]["files"], 1);
+    let site_count = scan_val["summary"]["sites"].as_u64().unwrap();
+    assert!(site_count > 0);
+    assert_eq!(scan_val["summary"]["covered"], 0);
+    assert_eq!(scan_val["summary"]["uncovered"], site_count);
+    assert_eq!(scan_val["files"][0]["file"], "src/active.py");
+    assert!(
+        scan_val["files"][0]["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["covered"] == false)
+    );
+
+    let scan_text = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--scan",
+            "--changed-lines",
+            "--use-existing-coverage",
+            "src/active.py",
+        ],
+        &[],
+    );
+    assert_eq!(scan_text.status.code(), Some(0));
+    let text_out = String::from_utf8(scan_text.stdout).unwrap();
+    let site_lines: Vec<&str> = text_out
+        .lines()
+        .filter(|l| l.contains("src/active.py:"))
+        .collect();
+    assert_eq!(site_lines.len(), site_count as usize);
+    assert!(
+        site_lines.iter().all(|l| l.contains(" uncovered")),
+        "expected every site line in text scan to show uncovered:\n{text_out}"
+    );
+
+    // Scoped mutate on `--lines 3` emits only touched `first` form and executed line-3 site(s).
+    let py = python_bin();
+    let pass_cmd = format!(
+        "{py} -c \"import sys; sys.path.insert(0, 'src'); from active import first; raise SystemExit(0 if first(2) == 4 else 1)\""
+    );
+    let scoped_run = run_mutator(
+        root,
+        &cache_dir.0,
+        &[
+            "--no-coverage",
+            "--no-metrics",
+            "--lines",
+            "3",
+            "--max-workers",
+            "1",
+            "--json",
+            "--test-command",
+            &pass_cmd,
+            "src/active.py",
+        ],
+        &[],
+    );
+    assert_eq!(scoped_run.status.code(), Some(0));
+    let run_val: serde_json::Value = serde_json::from_slice(&scoped_run.stdout).unwrap();
+    let forms = run_val["forms"].as_array().unwrap();
+    assert_eq!(forms.len(), 1);
+    assert_eq!(forms[0]["name"], "first");
+    let sites = run_val["sites"].as_array().unwrap();
+    assert!(!sites.is_empty());
+    assert_eq!(
+        run_val["summary"]["sites"].as_u64().unwrap() as usize,
+        sites.len()
+    );
+    assert!(
+        sites
+            .iter()
+            .all(|s| s["line"] == 3 && s["status"] == "killed"),
+        "expected compact line-3 killed sites only, got: {sites:?}"
     );
 }

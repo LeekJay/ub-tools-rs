@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -509,6 +509,47 @@ fn fn_word(count: usize) -> &'static str {
     if count == 1 { "function" } else { "functions" }
 }
 
+fn write_missing_coverage_warning(
+    err: &mut dyn Write,
+    bundle: Option<&CoverageBundle>,
+    entries: &[Entry],
+) {
+    let Some(bundle) = bundle else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut by_file: BTreeMap<&str, bool> = BTreeMap::new();
+    for entry in entries {
+        let covered = bundle.has_coverage_for_entry(
+            &entry.path,
+            &entry.language,
+            &entry.namespace,
+            &entry.name,
+        );
+        by_file
+            .entry(entry.path.as_str())
+            .and_modify(|seen| *seen |= covered)
+            .or_insert(covered);
+    }
+    let missing: Vec<&str> = by_file
+        .iter()
+        .filter_map(|(&path, &covered)| (!covered).then_some(path))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let total = by_file.len();
+    let file_word = if total == 1 { "file" } else { "files" };
+    let sample = missing[0];
+    let _ = writeln!(
+        err,
+        "[crapper] WARN: {}/{total} analyzed {file_word} missing from coverage report (scored as 0% coverage; e.g. {sample}). Re-run coverage if reports are stale.",
+        missing.len(),
+    );
+}
+
 fn threshold_status(options: &Options, entries: &[Entry], err: &mut dyn Write) -> i32 {
     let total = entries.len();
     let scored_count = entries.iter().filter(|e| e.crap.is_some()).count();
@@ -656,6 +697,7 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     if let Some(metrics) = written_path {
         let _ = writeln!(err, "Wrote {}", metrics.display());
     }
+    write_missing_coverage_warning(err, bundle.as_ref(), &entries);
     if untouched_over_threshold > 0
         && let (Some(threshold), Some((u_path, u_line, u_name, u_crap))) =
             (options.threshold, untouched_worst)
@@ -1173,6 +1215,10 @@ mod tests {
             fn_err.contains("[crapper] PASS (exit 0): all 1 scored function <= CRAP 10.0"),
             "expected pass verdict in stderr, got: {fn_err}"
         );
+        assert!(
+            !fn_err.contains("missing from coverage report"),
+            "covered file should not emit missing coverage warning: {fn_err}"
+        );
         let fn_json: serde_json::Value = serde_json::from_str(&fn_out).unwrap();
         assert_eq!(fn_json["summary"]["functions"], 1);
         assert_eq!(fn_json["entries"][0]["name"], "small_ok");
@@ -1187,18 +1233,39 @@ mod tests {
             "unexpected reminder below high threshold: {high_err}"
         );
 
-        // Add untracked new file and verify `--changed-functions` picks up its functions.
+        // Add untracked new file and verify `--changed-functions` picks up its functions
+        // and warns when that file is absent from coverage reports.
         fs::write(
             root.join("src/new_mod.py"),
             "def brand_new(y):\n    return y * 2\n",
         )
         .unwrap();
-        let (untracked_code, untracked_out, _) = run_fixture_cli(
+        let (untracked_code, untracked_out, untracked_err) = run_fixture_cli(
             &dir,
             &["--changed-functions", "--no-metrics", "--json"],
             "10.0",
         );
         assert_eq!(untracked_code, 0);
+        assert!(
+            untracked_err.contains(
+                "[crapper] WARN: 1/2 analyzed files missing from coverage report (scored as 0% coverage; e.g. src/new_mod.py)."
+            ),
+            "expected missing coverage warning in stderr, got: {untracked_err}"
+        );
+        let (_, _, nocov_err) = run_fixture_cli(
+            &dir,
+            &[
+                "--changed-functions",
+                "--no-coverage",
+                "--no-metrics",
+                "--json",
+            ],
+            "10.0",
+        );
+        assert!(
+            !nocov_err.contains("missing from coverage report"),
+            "--no-coverage must not warn about missing coverage: {nocov_err}"
+        );
         let untracked_json: serde_json::Value = serde_json::from_str(&untracked_out).unwrap();
         let names: Vec<&str> = untracked_json["entries"]
             .as_array()

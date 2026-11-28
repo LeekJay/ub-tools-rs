@@ -181,6 +181,7 @@ pub struct MutateReport<'a> {
     pub executed_killed: usize,
     pub executed_survived: usize,
     pub baseline_failed: bool,
+    pub scoped: bool,
 }
 
 #[derive(Serialize)]
@@ -210,9 +211,8 @@ struct ScanJson<'a> {
 
 /// Format `--scan` results as a single JSON object terminated with `\n`.
 ///
-/// When coverage is ignored or absent for a file, each site's `covered` field
-/// is `null` and `summary.covered` / `summary.uncovered` count only sites whose
-/// coverage was evaluated (`0` when coverage is not evaluated at all).
+/// When coverage is ignored (`--no-coverage`), each site's `covered` field
+/// is `null` and `summary.covered` / `summary.uncovered` stay `0`.
 pub fn format_scan_json(files: &[ScanFileData]) -> String {
     let mut total_sites = 0usize;
     let mut total_covered = 0usize;
@@ -313,7 +313,7 @@ pub fn format_mutate_json(report: &MutateReport<'_>) -> String {
     let killed: usize = report.forms.iter().map(|f| f.killed).sum();
     let survived: usize = report.forms.iter().map(|f| f.survived).sum();
     let uncovered: usize = report.forms.iter().map(|f| f.uncovered).sum();
-    let total_sites: usize = if report.forms.is_empty() {
+    let total_sites: usize = if report.scoped || report.forms.is_empty() {
         report.sites.len()
     } else {
         report.forms.iter().map(|f| f.sites).sum()
@@ -575,6 +575,7 @@ mod tests {
             executed_killed: 1,
             executed_survived: 0,
             baseline_failed: true,
+            scoped: false,
         });
         assert!(out.ends_with('\n'));
         let val: serde_json::Value = serde_json::from_str(&out).unwrap();

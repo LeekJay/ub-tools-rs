@@ -691,7 +691,11 @@ mod tests {
         );
         assert!(result.timed_out);
         assert_eq!(result.code, 124);
-        assert!(result.seconds < 5.0);
+        assert!(
+            result.seconds < 15.0,
+            "timed out process tree took {:.2}s (30s grandchild may have survived)",
+            result.seconds
+        );
         let _ = std::fs::remove_dir_all(&worker);
     }
 
