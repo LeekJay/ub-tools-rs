@@ -509,8 +509,10 @@ fn fn_word(count: usize) -> &'static str {
     if count == 1 { "function" } else { "functions" }
 }
 
-fn write_missing_coverage_warning(
+/// Warn on stderr when analyzed files are missing from coverage reports or newer than the latest report.
+fn write_coverage_freshness_warnings(
     err: &mut dyn Write,
+    root: &Path,
     bundle: Option<&CoverageBundle>,
     entries: &[Entry],
 ) {
@@ -533,21 +535,45 @@ fn write_missing_coverage_warning(
             .and_modify(|seen| *seen |= covered)
             .or_insert(covered);
     }
+    let total = by_file.len();
+    let file_word = if total == 1 { "file" } else { "files" };
     let missing: Vec<&str> = by_file
         .iter()
         .filter_map(|(&path, &covered)| (!covered).then_some(path))
         .collect();
-    if missing.is_empty() {
-        return;
+    if !missing.is_empty() {
+        let sample = missing[0];
+        let _ = writeln!(
+            err,
+            "[crapper] WARN: {}/{total} analyzed {file_word} missing from coverage report (scored as 0% coverage; e.g. {sample}). Re-run coverage if reports are stale.",
+            missing.len(),
+        );
     }
-    let total = by_file.len();
-    let file_word = if total == 1 { "file" } else { "files" };
-    let sample = missing[0];
-    let _ = writeln!(
-        err,
-        "[crapper] WARN: {}/{total} analyzed {file_word} missing from coverage report (scored as 0% coverage; e.g. {sample}). Re-run coverage if reports are stale.",
-        missing.len(),
-    );
+    if let Some(report_mtime) = bundle.newest_report_mtime {
+        let stale: Vec<&str> = by_file
+            .iter()
+            .filter_map(|(&path, &covered)| {
+                if !covered {
+                    return None;
+                }
+                let full = if Path::new(path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    root.join(path)
+                };
+                let src_mtime = std::fs::metadata(&full).and_then(|m| m.modified()).ok()?;
+                (src_mtime > report_mtime).then_some(path)
+            })
+            .collect();
+        if !stale.is_empty() {
+            let sample = stale[0];
+            let _ = writeln!(
+                err,
+                "[crapper] WARN: coverage report is older than {}/{total} analyzed {file_word} (e.g. {sample}); line coverage and CRAP scores may be stale. Re-run coverage to refresh.",
+                stale.len(),
+            );
+        }
+    }
 }
 
 fn threshold_status(options: &Options, entries: &[Entry], err: &mut dyn Write) -> i32 {
@@ -697,7 +723,7 @@ pub fn run_with_io(args: &[String], out: &mut dyn Write, err: &mut dyn Write) ->
     if let Some(metrics) = written_path {
         let _ = writeln!(err, "Wrote {}", metrics.display());
     }
-    write_missing_coverage_warning(err, bundle.as_ref(), &entries);
+    write_coverage_freshness_warnings(err, &root, bundle.as_ref(), &entries);
     if untouched_over_threshold > 0
         && let (Some(threshold), Some((u_path, u_line, u_name, u_crap))) =
             (options.threshold, untouched_worst)
@@ -1315,5 +1341,61 @@ mod tests {
         let comment_json: serde_json::Value = serde_json::from_str(&comment_out).unwrap();
         assert_eq!(comment_json["summary"]["functions"], 0);
         assert_eq!(comment_json["entries"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn warns_when_coverage_report_is_older_than_analyzed_sources() {
+        let dir = TestDir::new("stale-cov");
+        let root = &dir.0;
+        let src = root.join("src").join("app.py");
+        let lcov = root.join("coverage").join("lcov.info");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::create_dir_all(lcov.parent().unwrap()).unwrap();
+
+        fs::write(&src, "def small(x):\n    return x + 1\n").unwrap();
+        fs::write(&lcov, "SF:src/app.py\nDA:1,1\nDA:2,1\nend_of_record\n").unwrap();
+
+        let set_mtime = |path: &Path, secs: u64| {
+            let t = UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+
+        // 1. Report 60s older than analyzed source triggers stale-coverage WARN (without missing-file WARN).
+        set_mtime(&lcov, 1_700_000_000);
+        set_mtime(&src, 1_700_000_060);
+        let (stale_code, _, stale_err) = run_fixture_cli(&dir, &["--no-metrics"], "10.0");
+        assert_eq!(stale_code, 0);
+        assert!(
+            stale_err.contains(
+                "[crapper] WARN: coverage report is older than 1/1 analyzed file (e.g. src/app.py); line coverage and CRAP scores may be stale."
+            ),
+            "expected stale warning, got:\n{stale_err}"
+        );
+        assert!(!stale_err.contains("missing from coverage report"));
+
+        // 2. Newer report silences stale-coverage WARN cleanly.
+        set_mtime(&lcov, 1_700_000_120);
+        let (fresh_code, _, fresh_err) = run_fixture_cli(&dir, &["--no-metrics"], "10.0");
+        assert_eq!(fresh_code, 0);
+        assert!(
+            !fresh_err.contains("coverage report is older than"),
+            "unexpected stale warning when report is newer:\n{fresh_err}"
+        );
+        assert!(!fresh_err.contains("missing from coverage report"));
+
+        // 3. `--no-coverage` never warns about stale coverage reports even when lcov is older.
+        set_mtime(&lcov, 1_700_000_000);
+        let (nocov_code, _, nocov_err) =
+            run_fixture_cli(&dir, &["--no-coverage", "--no-metrics"], "10.0");
+        assert_eq!(nocov_code, 0);
+        assert!(
+            !nocov_err.contains("coverage report is older than"),
+            "--no-coverage must not emit stale warning:\n{nocov_err}"
+        );
     }
 }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -938,15 +939,19 @@ pub fn parse_jacoco_source_lines(text: &str) -> Result<BTreeMap<String, BTreeSet
     Ok(found)
 }
 
+/// Per-line Cloverage form hits mapped by source path.
+pub type FormHtmlMap = BTreeMap<String, BTreeMap<usize, (usize, usize)>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct CoverageBundle {
     pub lcov: BTreeMap<String, FileCoverage>,
     pub go_profile: Option<BTreeMap<String, Vec<GoSegment>>>,
     pub jacoco: Option<BTreeMap<String, Vec<JacocoMethod>>>,
-    pub form_html: BTreeMap<String, BTreeMap<usize, (usize, usize)>>,
+    pub form_html: FormHtmlMap,
     pub swift: BTreeMap<String, SwiftFile>,
     pub source_parts: Vec<Vec<String>>,
     pub root: Option<PathBuf>,
+    pub newest_report_mtime: Option<SystemTime>,
 }
 
 impl CoverageBundle {
@@ -1109,9 +1114,21 @@ fn is_skip_dir(path: &Path) -> bool {
         .is_some_and(|name| crate::discover::SKIP_DIRS.contains(&name))
 }
 
-fn merge_texts(paths: Vec<PathBuf>) -> Vec<String> {
+fn max_system_time(left: Option<SystemTime>, right: Option<SystemTime>) -> Option<SystemTime> {
+    match (left, right) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        _ => left.or(right),
+    }
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn read_texts_with_max_mtime(paths: Vec<PathBuf>) -> (Vec<String>, Option<SystemTime>) {
     let mut seen = BTreeSet::new();
     let mut texts = Vec::new();
+    let mut newest = None;
     for path in paths {
         let resolved = resolve_path(&path);
         if !seen.insert(resolved) {
@@ -1120,10 +1137,11 @@ fn merge_texts(paths: Vec<PathBuf>) -> Vec<String> {
         if let Some(text) = read_text(&path)
             && !text.is_empty()
         {
+            newest = max_system_time(newest, file_mtime(&path));
             texts.push(text);
         }
     }
-    texts
+    (texts, newest)
 }
 
 fn subdirs_1_and_2(root: &Path, tail: &[&str]) -> Vec<PathBuf> {
@@ -1157,14 +1175,10 @@ fn subdirs_1_and_2(root: &Path, tail: &[&str]) -> Vec<PathBuf> {
 }
 
 fn sort_paths_by_mtime_asc(paths: &mut [PathBuf]) {
-    paths.sort_by_key(|p| {
-        fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
+    paths.sort_by_key(|p| file_mtime(p).unwrap_or(SystemTime::UNIX_EPOCH));
 }
 
-fn merge_lcov(root: &Path) -> BTreeMap<String, FileCoverage> {
+fn merge_lcov(root: &Path) -> (BTreeMap<String, FileCoverage>, Option<SystemTime>) {
     let mut paths = Vec::new();
     collect_recursive_named(
         &root.join("target").join("coverage"),
@@ -1173,14 +1187,15 @@ fn merge_lcov(root: &Path) -> BTreeMap<String, FileCoverage> {
     );
     collect_recursive_named(&root.join("coverage"), "lcov.info", &mut paths);
     sort_paths_by_mtime_asc(&mut paths);
+    let (texts, mtime) = read_texts_with_max_mtime(paths);
     let mut merged = BTreeMap::new();
-    for text in merge_texts(paths) {
+    for text in texts {
         merged.extend(parse_lcov(&text));
     }
-    merged
+    (merged, mtime)
 }
 
-fn merge_go(root: &Path) -> BTreeMap<String, Vec<GoSegment>> {
+fn merge_go(root: &Path) -> (BTreeMap<String, Vec<GoSegment>>, Option<SystemTime>) {
     let mut paths = vec![
         root.join("target").join("coverage").join("coverage.out"),
         root.join("target")
@@ -1192,35 +1207,38 @@ fn merge_go(root: &Path) -> BTreeMap<String, Vec<GoSegment>> {
     for candidate in subdirs_1_and_2(root, &["target", "coverage", "go", "coverage.out"]) {
         paths.push(candidate);
     }
+    let (texts, mtime) = read_texts_with_max_mtime(paths);
     let mut merged: BTreeMap<String, Vec<GoSegment>> = BTreeMap::new();
-    for text in merge_texts(paths) {
+    for text in texts {
         if let Ok(parsed) = parse_go_profile(&text) {
             for (key, segs) in parsed {
                 merged.entry(key).or_default().extend(segs);
             }
         }
     }
-    merged
+    (merged, mtime)
 }
 
-fn merge_jacoco(root: &Path) -> BTreeMap<String, Vec<JacocoMethod>> {
+fn merge_jacoco(root: &Path) -> (BTreeMap<String, Vec<JacocoMethod>>, Option<SystemTime>) {
     let paths = subdirs_1_and_2(root, &["target", "site", "jacoco", "jacoco.xml"]);
+    let (texts, mtime) = read_texts_with_max_mtime(paths);
     let mut merged: BTreeMap<String, Vec<JacocoMethod>> = BTreeMap::new();
-    for text in merge_texts(paths) {
+    for text in texts {
         if let Ok(parsed) = parse_jacoco_index(&text) {
             for (key, methods) in parsed {
                 merged.entry(key).or_default().extend(methods);
             }
         }
     }
-    merged
+    (merged, mtime)
 }
 
-fn merge_forms(root: &Path) -> BTreeMap<String, BTreeMap<usize, (usize, usize)>> {
+fn merge_forms(root: &Path) -> (FormHtmlMap, Option<SystemTime>) {
     let coverage_dir = root.join("target").join("coverage");
     let mut found = BTreeMap::new();
+    let mut newest = None;
     if !coverage_dir.is_dir() {
-        return found;
+        return (found, newest);
     }
     for entry in walkdir::WalkDir::new(&coverage_dir).into_iter().flatten() {
         if !entry.file_type().is_file() {
@@ -1239,6 +1257,7 @@ fn merge_forms(root: &Path) -> BTreeMap<String, BTreeMap<usize, (usize, usize)>>
         let Ok(rel) = html_path.strip_prefix(&coverage_dir) else {
             continue;
         };
+        newest = max_system_time(newest, file_mtime(html_path));
         let rel_str = crate::path_util::to_posix(rel);
         let key = rel_str
             .strip_suffix(".html")
@@ -1246,13 +1265,13 @@ fn merge_forms(root: &Path) -> BTreeMap<String, BTreeMap<usize, (usize, usize)>>
             .to_string();
         found.insert(key, parse_form_coverage(&text));
     }
-    found
+    (found, newest)
 }
 
-fn merge_swift(root: &Path) -> BTreeMap<String, SwiftFile> {
+fn merge_swift(root: &Path) -> (BTreeMap<String, SwiftFile>, Option<SystemTime>) {
     let coverage = root.join("target").join("coverage").join("swift");
     if !coverage.is_dir() {
-        return BTreeMap::new();
+        return (BTreeMap::new(), None);
     }
     let mut json_paths = Vec::new();
     for entry in walkdir::WalkDir::new(&coverage).into_iter().flatten() {
@@ -1263,8 +1282,9 @@ fn merge_swift(root: &Path) -> BTreeMap<String, SwiftFile> {
         }
     }
     json_paths.sort();
+    let (texts, mtime) = read_texts_with_max_mtime(json_paths);
     let mut merged: BTreeMap<String, SwiftFile> = BTreeMap::new();
-    for text in merge_texts(json_paths) {
+    for text in texts {
         let Ok(parsed) = parse_swift_coverage(&text) else {
             continue;
         };
@@ -1274,17 +1294,17 @@ fn merge_swift(root: &Path) -> BTreeMap<String, SwiftFile> {
             entry.summaries.extend(record.summaries);
         }
     }
-    merged
+    (merged, mtime)
 }
 
 /// Load merged LCOV line and branch records under `root`.
 pub fn load_lcov(root: &Path) -> BTreeMap<String, FileCoverage> {
-    merge_lcov(root)
+    merge_lcov(root).0
 }
 
 /// Load Go coverage segments under `root`, or `None` if absent/empty.
 pub fn load_go_profile(root: &Path) -> Option<BTreeMap<String, Vec<GoSegment>>> {
-    let profile = merge_go(root);
+    let (profile, _) = merge_go(root);
     if profile.is_empty() {
         None
     } else {
@@ -1293,37 +1313,51 @@ pub fn load_go_profile(root: &Path) -> Option<BTreeMap<String, Vec<GoSegment>>> 
 }
 
 /// Load Cloverage HTML form coverage under `root`.
-pub fn load_form_html(root: &Path) -> BTreeMap<String, BTreeMap<usize, (usize, usize)>> {
-    merge_forms(root)
+pub fn load_form_html(root: &Path) -> FormHtmlMap {
+    merge_forms(root).0
 }
 
 /// Load Swift llvm-cov/xccov coverage under `root`.
 pub fn load_swift(root: &Path) -> BTreeMap<String, SwiftFile> {
-    merge_swift(root)
+    merge_swift(root).0
 }
 
 pub fn load_bundle(root: &Path) -> CoverageBundle {
-    let jacoco = merge_jacoco(root);
+    let (lcov, lcov_mtime) = merge_lcov(root);
+    let (go_profile, go_mtime) = merge_go(root);
+    let (jacoco, jacoco_mtime) = merge_jacoco(root);
+    let (form_html, forms_mtime) = merge_forms(root);
+    let (swift, swift_mtime) = merge_swift(root);
+    let newest_report_mtime = [lcov_mtime, go_mtime, jacoco_mtime, forms_mtime, swift_mtime]
+        .into_iter()
+        .flatten()
+        .max();
     CoverageBundle {
-        lcov: load_lcov(root),
-        go_profile: load_go_profile(root),
+        lcov,
+        go_profile: if go_profile.is_empty() {
+            None
+        } else {
+            Some(go_profile)
+        },
         jacoco: if jacoco.is_empty() {
             None
         } else {
             Some(jacoco)
         },
-        form_html: load_form_html(root),
-        swift: load_swift(root),
+        form_html,
+        swift,
         source_parts: Vec::new(),
         root: Some(root.to_path_buf()),
+        newest_report_mtime,
     }
 }
 
 /// Load Java `<sourcefile><line ...>` covered lines across all JaCoCo reports under `root`.
 pub fn load_jacoco_source_lines(root: &Path) -> BTreeMap<String, BTreeSet<usize>> {
     let paths = subdirs_1_and_2(root, &["target", "site", "jacoco", "jacoco.xml"]);
+    let (texts, _) = read_texts_with_max_mtime(paths);
     let mut merged = BTreeMap::new();
-    for text in merge_texts(paths) {
+    for text in texts {
         if let Ok(parsed) = parse_jacoco_source_lines(&text) {
             merged.extend(parsed);
         }
