@@ -22,7 +22,7 @@ Acts strictly as an objective verifier (never modifying code, installing tools, 
 | Gate | Tool | Configured Read-Only Flags in `SKILL.md` |
 | --- | --- | --- |
 | Complexity | [`crapper`](../../crates/crapper) | `--changed-functions --json --threshold 10` (implies `--no-metrics`, optional `--base <ref>`, prints untouched over-threshold legacy counts on `stderr`) |
-| Duplication | [`dryer`](../../crates/dryer) | `--focus-changed --json --threshold 0.8` across the relevant source root (implies `--no-metrics`, optional `--base <ref>`, focuses output on pairs touching changed files) |
+| Duplication | [`dryer`](../../crates/dryer) | `--focus-changed --json --threshold 0.8` across the relevant source root (implies `--no-metrics`, optional `--base <ref>`, focuses output on pairs overlapping changed lines) |
 | Mutation sites | [`mutator`](../../crates/mutator) | `--scan --changed-lines --json` first to filter out non-decision lines, then `--lines`, scoped `--test-command` for slow runners, `--no-metrics` when read-only, and `--json` (streams live progress and separates `this run` vs. `carried-forward` verdicts on `stderr`) |
 
 ## Installation

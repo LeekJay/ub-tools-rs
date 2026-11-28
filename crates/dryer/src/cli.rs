@@ -1,6 +1,6 @@
 //! Command line parsing, git-changed file selection, and report orchestration.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,8 +44,9 @@ Options:
   --changed                     Compare added and modified source files from
                                 git status.
   --focus-changed               Scan full target scope, but report only
-                                duplicate pairs touching a git-changed file
-                                (implies --no-metrics).
+                                duplicate pairs overlapping git-changed lines
+                                (plus all forms in new files; implies
+                                --no-metrics).
   --base <ref>                  Git base ref for --changed or --focus-changed
                                 (compares <ref> against working tree).
   --threshold N                 Minimum similarity score, default 0.82.
@@ -455,6 +456,47 @@ fn changed_source_with_base(
         .collect())
 }
 
+fn changed_source_lines(
+    root: &Path,
+    base: Option<&str>,
+) -> Result<HashMap<String, ub_runtime::ChangedLines>, GitStatusError> {
+    let root_resolved = resolve_path(root);
+    let entries = ub_runtime::git_changed_lines(&root_resolved, base)?;
+    let mut focused = HashMap::new();
+    for (path, lines) in entries {
+        if !tracked_source(&path, Some(&root_resolved)) {
+            continue;
+        }
+        let resolved = resolve_path(&path);
+        let rel = match resolved.strip_prefix(&root_resolved) {
+            Ok(stripped) => to_posix(stripped),
+            Err(_) => to_posix(&resolved),
+        };
+        focused.insert(rel, lines);
+    }
+    Ok(focused)
+}
+
+fn span_overlaps_changed(
+    span: &super::model::Span,
+    focused: &HashMap<String, ub_runtime::ChangedLines>,
+) -> bool {
+    focused
+        .get(&span.file)
+        .is_some_and(|lines| lines.overlaps(span.start_line, span.end_line))
+}
+
+fn write_focus_excluded_info(err: &mut dyn Write, excluded: usize, threshold: f64) {
+    if excluded == 0 {
+        return;
+    }
+    let pair_word = if excluded == 1 { "pair" } else { "pairs" };
+    let _ = writeln!(
+        err,
+        "[dryer] INFO (non-blocking): {excluded} unchanged legacy duplicate {pair_word} >= {threshold:.2} excluded by --focus-changed."
+    );
+}
+
 fn positionals(root: &Path, args: &[String]) -> (Vec<PathBuf>, Vec<String>) {
     let mut existing = Vec::new();
     let mut filters = Vec::new();
@@ -600,34 +642,28 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
     }
 
     let root = resolve_path(&options.project_root);
-    let focused_set = if options.focus_changed {
-        let changed = match changed_source_with_base(&root, options.base.as_deref()) {
-            Ok(files) => files,
+    let focused_lines = if options.focus_changed {
+        let map = match changed_source_lines(&root, options.base.as_deref()) {
+            Ok(map) => map,
             Err(git_err) => {
                 let _ = writeln!(err, "{}", git_err.message);
                 return git_err.code;
             }
         };
-        let set: HashSet<String> = changed
-            .into_iter()
-            .map(|path| match path.strip_prefix(&root) {
-                Ok(rel) => to_posix(rel),
-                Err(_) => to_posix(&path),
-            })
-            .collect();
-        if set.is_empty() {
+        if map.is_empty() {
             let _ = write!(
                 out,
                 "{}",
                 format_report(&[], 0, options.threshold, &options.format)
             );
+            let _ = out.flush();
             let _ = writeln!(
                 err,
                 "[dryer] PASS (exit 0): 0 changed source files to focus (0 duplicates)."
             );
             return 0;
         }
-        Some(set)
+        Some(map)
     } else {
         None
     };
@@ -646,6 +682,7 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
         } else {
             let _ = writeln!(out, "No source files to analyze.");
         }
+        let _ = out.flush();
         let _ = writeln!(
             err,
             "[dryer] PASS (exit 0): 0 source files matched (0 duplicates)."
@@ -666,56 +703,42 @@ pub fn run_with_writers(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
     for warning in warnings {
         let _ = writeln!(err, "[dryer] WARN: {warning}");
     }
-    if let Some(ref focused_rel) = focused_set {
+    let mut excluded_by_focus = 0usize;
+    if let Some(ref focused) = focused_lines {
         let before = candidates.len();
         candidates.retain(|dup| {
-            focused_rel.contains(&dup.left.file) || focused_rel.contains(&dup.right.file)
+            span_overlaps_changed(&dup.left, focused) || span_overlaps_changed(&dup.right, focused)
         });
-        let excluded = before - candidates.len();
-        if excluded > 0 {
-            let pair_word = if excluded == 1 { "pair" } else { "pairs" };
-            let _ = writeln!(
-                err,
-                "[dryer] INFO (non-blocking): {excluded} unchanged legacy duplicate {pair_word} >= {:.2} excluded by --focus-changed.",
-                options.threshold
-            );
-        }
+        excluded_by_focus = before - candidates.len();
     }
-    if options.no_metrics {
-        let _ = write!(
-            out,
-            "{}",
-            format_report(
-                &candidates,
-                entries_scanned,
-                options.threshold,
-                &options.format
-            )
-        );
-        write_dryer_summary(err, &candidates, entries_scanned, options.threshold);
-        return 0;
-    }
-    match write_metrics(&candidates, &root) {
-        Ok(metrics) => {
-            let _ = write!(
-                out,
-                "{}",
-                format_report(
-                    &candidates,
-                    entries_scanned,
-                    options.threshold,
-                    &options.format
-                )
-            );
-            let _ = writeln!(err, "Wrote {}", metrics.display());
-            write_dryer_summary(err, &candidates, entries_scanned, options.threshold);
-            0
+    let written_path = if options.no_metrics {
+        None
+    } else {
+        match write_metrics(&candidates, &root) {
+            Ok(metrics) => Some(metrics),
+            Err(io_err) => {
+                let _ = writeln!(err, "dryer: failed to write metrics: {io_err}");
+                return 1;
+            }
         }
-        Err(io_err) => {
-            let _ = writeln!(err, "dryer: failed to write metrics: {io_err}");
-            1
-        }
+    };
+    let _ = write!(
+        out,
+        "{}",
+        format_report(
+            &candidates,
+            entries_scanned,
+            options.threshold,
+            &options.format
+        )
+    );
+    let _ = out.flush();
+    if let Some(metrics) = written_path {
+        let _ = writeln!(err, "Wrote {}", metrics.display());
     }
+    write_focus_excluded_info(err, excluded_by_focus, options.threshold);
+    write_dryer_summary(err, &candidates, entries_scanned, options.threshold);
+    0
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -1335,6 +1358,16 @@ mod tests {
             focus_err.contains("[dryer] FOUND (exit 0, review required): 1 duplicate pair"),
             "stderr was: {focus_err}"
         );
+        let info_pos = focus_err
+            .find("[dryer] INFO (non-blocking): 1 unchanged legacy duplicate pair")
+            .unwrap();
+        let found_pos = focus_err
+            .find("[dryer] FOUND (exit 0, review required): 1 duplicate pair")
+            .unwrap();
+        assert!(
+            info_pos < found_pos,
+            "expected INFO before FOUND in stderr:\n{focus_err}"
+        );
         let focus_val: serde_json::Value = serde_json::from_str(&focus_out).unwrap();
         assert_eq!(focus_val["summary"]["duplicates"], 1);
         let pair = &focus_val["candidates"][0];
@@ -1356,5 +1389,150 @@ mod tests {
         );
         let base_val: serde_json::Value = serde_json::from_str(&base_out).unwrap();
         assert_eq!(base_val["summary"]["duplicates"], 1);
+    }
+
+    #[test]
+    fn focus_changed_filters_at_line_granularity_inside_modified_files() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("dryer-focus-lines-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let guard = TempDirGuard(base);
+        let repo = &guard.0;
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "dev@example.com"]);
+        git(&["config", "user.name", "Dev"]);
+
+        let legacy_a = "\
+def legacy_fn_a(x, y):
+    total = x + y
+    if total > 5:
+        return total * 2
+    return total
+";
+        let legacy_b = "\
+def legacy_fn_b(p, q):
+    summed = p + q
+    if summed > 9:
+        return summed * 3
+    return summed
+";
+        let unrelated = "\
+def unrelated_fn():
+    return 1
+";
+        let shared_helper = "\
+def shared_helper(items, limit):
+    selected = []
+    for item in items:
+        if item > limit:
+            selected.append(item)
+    return selected
+";
+        let copied_helper = "\
+def copied_helper(entries, cutoff):
+    chosen = []
+    for entry in entries:
+        if entry > cutoff:
+            chosen.append(entry)
+    return chosen
+";
+
+        std::fs::write(repo.join("src/legacy_other.py"), legacy_a).unwrap();
+        let mixed_initial = format!("{legacy_b}\n{unrelated}");
+        std::fs::write(repo.join("src/mixed.py"), &mixed_initial).unwrap();
+        std::fs::write(repo.join("src/base.py"), shared_helper).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "initial"]);
+
+        let assert_stderr_order = |stderr: &str, excluded_msg: &str, verdict_msg: &str| {
+            let info_pos = stderr
+                .find(excluded_msg)
+                .unwrap_or_else(|| panic!("missing `{excluded_msg}` in stderr:\n{stderr}"));
+            let verdict_pos = stderr
+                .find(verdict_msg)
+                .unwrap_or_else(|| panic!("missing `{verdict_msg}` in stderr:\n{stderr}"));
+            assert!(
+                info_pos < verdict_pos,
+                "expected `{excluded_msg}` before `{verdict_msg}`:\n{stderr}"
+            );
+        };
+
+        // Append `copied_helper` to `src/mixed.py` without touching `legacy_fn_b`.
+        let mixed_with_copy = format!("{mixed_initial}\n{copied_helper}");
+        std::fs::write(repo.join("src/mixed.py"), &mixed_with_copy).unwrap();
+
+        let (wt_code, wt_out, wt_err) = run_fixture_scan(repo, &["--focus-changed", "--json"]);
+        assert_eq!(wt_code, 0);
+        let wt_val: serde_json::Value = serde_json::from_str(&wt_out).unwrap();
+        assert_eq!(wt_val["summary"]["duplicates"], 1);
+        let pair = &wt_val["candidates"][0];
+        let mixed_side = if pair["left"]["file"] == "src/mixed.py" {
+            &pair["left"]
+        } else {
+            &pair["right"]
+        };
+        let other_side = if pair["left"]["file"] == "src/mixed.py" {
+            &pair["right"]
+        } else {
+            &pair["left"]
+        };
+        assert_eq!(mixed_side["file"], "src/mixed.py");
+        assert_eq!(other_side["file"], "src/base.py");
+        assert!(
+            mixed_side["start_line"].as_u64().unwrap() > 8,
+            "expected copied_helper span after unrelated_fn, got {mixed_side}"
+        );
+        assert_stderr_order(
+            &wt_err,
+            "[dryer] INFO (non-blocking): 1 unchanged legacy duplicate pair",
+            "[dryer] FOUND (exit 0, review required): 1 duplicate pair",
+        );
+
+        // Commit `src/mixed.py` and verify `--focus-changed --base HEAD~1` preserves the result.
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "add copied helper in mixed"]);
+        let (base_code, base_out, base_err) =
+            run_fixture_scan(repo, &["--focus-changed", "--base", "HEAD~1", "--json"]);
+        assert_eq!(base_code, 0);
+        let base_val: serde_json::Value = serde_json::from_str(&base_out).unwrap();
+        assert_eq!(base_val["summary"]["duplicates"], 1);
+        assert_stderr_order(
+            &base_err,
+            "[dryer] INFO (non-blocking): 1 unchanged legacy duplicate pair",
+            "[dryer] FOUND (exit 0, review required): 1 duplicate pair",
+        );
+
+        // Edit only `unrelated_fn` so neither duplicate pair overlaps the touched lines.
+        let mixed_edited_unrelated = mixed_with_copy.replace("return 1", "return 42");
+        std::fs::write(repo.join("src/mixed.py"), &mixed_edited_unrelated).unwrap();
+        let (clean_code, clean_out, clean_err) =
+            run_fixture_scan(repo, &["--focus-changed", "--json"]);
+        assert_eq!(clean_code, 0);
+        let clean_val: serde_json::Value = serde_json::from_str(&clean_out).unwrap();
+        assert_eq!(clean_val["summary"]["duplicates"], 0);
+        assert_stderr_order(
+            &clean_err,
+            "[dryer] INFO (non-blocking): 2 unchanged legacy duplicate pairs",
+            "[dryer] PASS (exit 0): 0 duplicate pairs",
+        );
     }
 }

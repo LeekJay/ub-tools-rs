@@ -113,7 +113,7 @@ Every time you are asked to make a change follow:
 
 ## Dryer
 
-* Use the dryer tool (`--focus-changed --threshold 0.8 --json`, adding `--base <ref>` for committed branch diffs; implies `--no-metrics` while still scanning full target scope and focusing output on changed files; omit `--focus-changed` for full-repo audits) to eliminate duplication that ranks 0.8 or above.
+* Use the dryer tool (`--focus-changed --threshold 0.8 --json`, adding `--base <ref>` for committed branch diffs; implies `--no-metrics` while still scanning full target scope and focusing output on changed lines; omit `--focus-changed` for full-repo audits) to eliminate duplication that ranks 0.8 or above.
 
 ## Mutator
 
